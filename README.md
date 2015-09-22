@@ -21,6 +21,10 @@ Because private keys are the only _long-term_ secret being used.
 
 Depending on how OpenSSL is used it might be benefitial to separate symmetric cipher operations or TLS operations as a whole.  But even in such case it would still be a good idea to isolate private key operations from them considering the impact of private key leaks.
 
+### Q. Is there any HTTP server that uses Neverbleed?
+
+Neverbleed is developed as part of the [H2O](https://h2o.examp1e.net/) HTTP2 server, is going to be included in its 1.5 release.
+
 How-to
 ------
 
