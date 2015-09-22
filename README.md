@@ -1,11 +1,11 @@
 openssl-privsep
 ===============
 
-openssl-privsep is an OpenSSL engine that runs RSA private key operations in an isolated process, thereby minimizing the risk of private key leak in case of an vulnerability such as Heartbleed.
+openssl-privsep is an OpenSSL engine that runs RSA private key operations in an isolated process, thereby minimizing the risk of private key leak in case of vulnerability such as Heartbleed.
 
 The engine can be used together with existing versions of OpenSSL or LibreSSL, with minimal changes to the server source code.
 
-How To
+How-to
 ------
 
 The library exposes two functions: `openssl_privsep_init` and `openssl_privsep_load_private_key_file`.
@@ -15,7 +15,7 @@ The first function spawns an external process dedicated to private key operation
 By
 
 1. adding call to `openssl_privsep_init`
-2. replacing call to `SSL_CTX_use_PrivateKey_file` to `openssl_privsep_load_private_key_file`
+2. replacing call to `SSL_CTX_use_PrivateKey_file` with `openssl_privsep_load_private_key_file`
 
 the privilege separation engine will be used for all the incoming TLS connections.
 
