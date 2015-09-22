@@ -19,8 +19,8 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-#ifndef OPENSSL_PRIVSEP_H
-#define OPENSSL_PRIVSEP_H
+#ifndef NEVERBLEED_H
+#define NEVERBLEED_H
 
 #include <pthread.h>
 #include <sys/un.h>
@@ -30,28 +30,28 @@
 extern "C" {
 #endif
 
-#define OPENSSL_PRIVSEP_ERRBUF_SIZE (256)
-#define OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE 32
+#define NEVERBLEED_ERRBUF_SIZE (256)
+#define NEVERBLEED_AUTH_TOKEN_SIZE 32
 
-typedef struct st_openssl_privsep_t {
+typedef struct st_neverbleed_t {
     ENGINE *engine;
     struct sockaddr_un sun_;
     pthread_key_t thread_key;
-    unsigned char auth_token[OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE];
-} openssl_privsep_t;
+    unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
+} neverbleed_t;
 
 /**
  * initializes the privilege separation engine (returns 0 if successful)
  */
-int openssl_privsep_init(openssl_privsep_t *psep, char *errbuf);
+int neverbleed_init(neverbleed_t *nb, char *errbuf);
 /**
  * loads a private key file (returns 0 if successful, -1 if failed)
  */
-int openssl_privsep_load_private_key_file(openssl_privsep_t *psep, SSL_CTX *ctx, const char *fn, char *errbuf);
+int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf);
 /**
  * setuid
  */
-int openssl_privsep_setuid(openssl_privsep_t *psep, uid_t uid);
+int neverbleed_setuid(neverbleed_t *nb, uid_t uid);
 
 #ifdef __cplusplus
 }

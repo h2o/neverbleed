@@ -26,7 +26,7 @@
 #include <unistd.h>
 #include <openssl/crypto.h>
 #include <openssl/ssl.h>
-#include "openssl-privsep.h"
+#include "neverbleed.h"
 
 static void setup_ecc_key(SSL_CTX *ssl_ctx)
 {
@@ -93,15 +93,15 @@ int main(int argc, char **argv)
 {
     unsigned short port;
     SSL_CTX *ctx;
-    openssl_privsep_t psep;
-    char errbuf[OPENSSL_PRIVSEP_ERRBUF_SIZE];
+    neverbleed_t nb;
+    char errbuf[NEVERBLEED_ERRBUF_SIZE];
     int use_privsep;
 
     /* initialization */
     SSL_load_error_strings();
     SSL_library_init();
     OpenSSL_add_all_algorithms();
-    if (openssl_privsep_init(&psep, errbuf) != 0) {
+    if (neverbleed_init(&nb, errbuf) != 0) {
         fprintf(stderr, "openssl_privsep_init: %s\n", errbuf);
         return 111;
     }
@@ -131,7 +131,7 @@ int main(int argc, char **argv)
         return 111;
     }
     if (use_privsep) {
-        if (openssl_privsep_load_private_key_file(&psep, ctx, argv[4], errbuf) != 1) {
+        if (neverbleed_load_private_key_file(&nb, ctx, argv[4], errbuf) != 1) {
             fprintf(stderr, "failed to load private key from file:%s:%s\n", argv[4], errbuf);
             return 111;
         }

@@ -36,7 +36,7 @@
 #include <unistd.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
-#include "openssl-privsep.h"
+#include "neverbleed.h"
 
 struct expbuf_t {
     char *buf;
@@ -45,12 +45,12 @@ struct expbuf_t {
     size_t capacity;
 };
 
-struct st_openssl_privsep_rsa_exdata_t {
-    openssl_privsep_t *psep;
+struct st_neverbleed_rsa_exdata_t {
+    neverbleed_t *nb;
     size_t key_index;
 };
 
-struct st_openssl_privsep_thread_data_t {
+struct st_neverbleed_thread_data_t {
     int fd;
 };
 
@@ -263,45 +263,45 @@ static void unlink_dir(const char *path)
 
 void dispose_thread_data(void *_thdata)
 {
-    struct st_openssl_privsep_thread_data_t *thdata = _thdata;
+    struct st_neverbleed_thread_data_t *thdata = _thdata;
     assert(thdata->fd >= 0);
     close(thdata->fd);
     thdata->fd = -1;
 }
 
-struct st_openssl_privsep_thread_data_t *get_thread_data(openssl_privsep_t *psep)
+struct st_neverbleed_thread_data_t *get_thread_data(neverbleed_t *nb)
 {
-    struct st_openssl_privsep_thread_data_t *thdata;
+    struct st_neverbleed_thread_data_t *thdata;
     ssize_t r;
 
-    if ((thdata = pthread_getspecific(psep->thread_key)) != NULL)
+    if ((thdata = pthread_getspecific(nb->thread_key)) != NULL)
         return thdata;
 
     if ((thdata = malloc(sizeof(*thdata))) == NULL)
         dief("malloc failed");
     if ((thdata->fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1)
         dief("socket(2) failed");
-    while (connect(thdata->fd, (void *)&psep->sun_, sizeof(psep->sun_)) != 0)
+    while (connect(thdata->fd, (void *)&nb->sun_, sizeof(nb->sun_)) != 0)
         if (errno != EINTR)
             dief("failed to connect to privsep daemon");
-    while ((r = write(thdata->fd, psep->auth_token, sizeof(psep->auth_token))) == -1 && errno == EINTR)
+    while ((r = write(thdata->fd, nb->auth_token, sizeof(nb->auth_token))) == -1 && errno == EINTR)
         ;
-    if (r != sizeof(psep->auth_token))
+    if (r != sizeof(nb->auth_token))
         dief("failed to send authentication token");
-    pthread_setspecific(psep->thread_key, thdata);
+    pthread_setspecific(nb->thread_key, thdata);
 
     return thdata;
 }
 
-static void get_privsep_data(const RSA *rsa, struct st_openssl_privsep_rsa_exdata_t **exdata,
-                             struct st_openssl_privsep_thread_data_t **thdata)
+static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t **exdata,
+                             struct st_neverbleed_thread_data_t **thdata)
 {
     *exdata = RSA_get_ex_data(rsa, 0);
     if (*exdata == NULL) {
         errno = 0;
         dief("invalid internal ref");
     }
-    *thdata = get_thread_data((*exdata)->psep);
+    *thdata = get_thread_data((*exdata)->nb);
 }
 
 static struct {
@@ -312,7 +312,7 @@ static struct {
     PTHREAD_MUTEX_INITIALIZER
 };
 
-static unsigned char daemon_auth_token[OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE];
+static unsigned char daemon_auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
 
 static RSA *daemon_get_rsa(size_t key_index)
 {
@@ -342,8 +342,8 @@ static size_t daemon_set_rsa(RSA *rsa)
 
 static int priv_encdec_proxy(const char *cmd, int flen, const unsigned char *from, unsigned char *_to, RSA *rsa, int padding)
 {
-    struct st_openssl_privsep_rsa_exdata_t *exdata;
-    struct st_openssl_privsep_thread_data_t *thdata;
+    struct st_neverbleed_rsa_exdata_t *exdata;
+    struct st_neverbleed_thread_data_t *thdata;
     struct expbuf_t buf = {};
     size_t ret;
     unsigned char *to;
@@ -424,8 +424,8 @@ static int priv_dec_stub(struct expbuf_t *buf)
 static int sign_proxy(int type, const unsigned char *m, unsigned int m_len, unsigned char *_sigret, unsigned *_siglen,
                       const RSA *rsa)
 {
-    struct st_openssl_privsep_rsa_exdata_t *exdata;
-    struct st_openssl_privsep_thread_data_t *thdata;
+    struct st_neverbleed_rsa_exdata_t *exdata;
+    struct st_neverbleed_thread_data_t *thdata;
     struct expbuf_t buf = {};
     size_t ret, siglen;
     unsigned char *sigret;
@@ -481,9 +481,9 @@ static int sign_stub(struct expbuf_t *buf)
     return 0;
 }
 
-static EVP_PKEY *create_pkey(openssl_privsep_t *psep, size_t key_index, const char *ebuf, const char *nbuf)
+static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebuf, const char *nbuf)
 {
-    struct st_openssl_privsep_rsa_exdata_t *exdata;
+    struct st_neverbleed_rsa_exdata_t *exdata;
     RSA *rsa;
     EVP_PKEY *pkey;
 
@@ -491,10 +491,10 @@ static EVP_PKEY *create_pkey(openssl_privsep_t *psep, size_t key_index, const ch
         fprintf(stderr, "no memory\n");
         abort();
     }
-    exdata->psep = psep;
+    exdata->nb = nb;
     exdata->key_index = key_index;
 
-    rsa = RSA_new_method(psep->engine);
+    rsa = RSA_new_method(nb->engine);
     RSA_set_ex_data(rsa, 0, exdata);
     if (BN_hex2bn(&rsa->e, ebuf) == 0) {
         fprintf(stderr, "failed to parse e:%s\n", ebuf);
@@ -513,9 +513,9 @@ static EVP_PKEY *create_pkey(openssl_privsep_t *psep, size_t key_index, const ch
     return pkey;
 }
 
-int openssl_privsep_load_private_key_file(openssl_privsep_t *psep, SSL_CTX *ctx, const char *fn, char *errbuf)
+int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf)
 {
-    struct st_openssl_privsep_thread_data_t *thdata = get_thread_data(psep);
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     struct expbuf_t buf = {};
     size_t ret, key_index;
     char *estr, *nstr, *errstr;
@@ -536,14 +536,14 @@ int openssl_privsep_load_private_key_file(openssl_privsep_t *psep, SSL_CTX *ctx,
     }
 
     if (ret != 1) {
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "%s", errstr);
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "%s", errstr);
         return -1;
     }
 
     /* success */
-    pkey = create_pkey(psep, key_index, estr, nstr);
+    pkey = create_pkey(nb, key_index, estr, nstr);
     if (SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "SSL_CTX_use_PrivateKey failed");
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "SSL_CTX_use_PrivateKey failed");
         ret = 0;
     }
     EVP_PKEY_free(pkey);
@@ -556,7 +556,7 @@ static int load_key_stub(struct expbuf_t *buf)
     FILE *fp = NULL;
     RSA *rsa = NULL;
     size_t key_index = SIZE_MAX;
-    char *estr = NULL, *nstr = NULL, errbuf[OPENSSL_PRIVSEP_ERRBUF_SIZE] = "";
+    char *estr = NULL, *nstr = NULL, errbuf[NEVERBLEED_ERRBUF_SIZE] = "";
 
     if ((fn = expbuf_shift_str(buf)) == NULL) {
         warnf("%s: failed to parse request", __FUNCTION__);
@@ -594,9 +594,9 @@ Respond:
     return 0;
 }
 
-int openssl_privsep_setuid(openssl_privsep_t *psep, uid_t uid)
+int neverbleed_setuid(neverbleed_t *nb, uid_t uid)
 {
-    struct st_openssl_privsep_thread_data_t *thdata = get_thread_data(psep);
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     struct expbuf_t buf = {};
     size_t ret;
 
@@ -656,14 +656,14 @@ static void *daemon_conn_thread(void *_sock_fd)
 {
     int sock_fd = (int)_sock_fd;
     struct expbuf_t buf = {};
-    unsigned char auth_token[OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE];
+    unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
 
     /* authenticate */
     if (read_nbytes(sock_fd, &auth_token, sizeof(auth_token)) != 0) {
         warnf("failed to receive authencication token from client");
         goto Exit;
     }
-    if (memcmp(auth_token, daemon_auth_token, OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE) != 0) {
+    if (memcmp(auth_token, daemon_auth_token, NEVERBLEED_AUTH_TOKEN_SIZE) != 0) {
         warnf("client authentication failed");
         goto Exit;
     }
@@ -751,7 +751,7 @@ static RSA_METHOD rsa_method = {
     NULL /* rsa_keygen */
 };
 
-int openssl_privsep_init(openssl_privsep_t *psep, char *errbuf)
+int neverbleed_init(neverbleed_t *nb, char *errbuf)
 {
     int pipe_fds[2] = {-1, -1}, listen_fd;
     char *tempdir = NULL;
@@ -763,41 +763,41 @@ int openssl_privsep_init(openssl_privsep_t *psep, char *errbuf)
 
     /* setup the daemon */
     if (pipe(pipe_fds) != 0) {
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "pipe(2) failed:%s", strerror(errno));
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "pipe(2) failed:%s", strerror(errno));
         goto Fail;
     }
     fcntl(pipe_fds[1], F_SETFD, O_CLOEXEC);
     if ((tempdir = strdup("/tmp/openssl-privsep.XXXXXX")) == NULL) {
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "no memory");
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "no memory");
         goto Fail;
     }
     if (mkdtemp(tempdir) == NULL) {
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "failed to create temporary directory under /tmp:%s", strerror(errno));
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "failed to create temporary directory under /tmp:%s", strerror(errno));
         goto Fail;
     }
-    memset(&psep->sun_, 0, sizeof(psep->sun_));
-    psep->sun_.sun_family = AF_UNIX;
-    snprintf(psep->sun_.sun_path, sizeof(psep->sun_.sun_path), "%s/_", tempdir);
-    RAND_bytes(psep->auth_token, sizeof(psep->auth_token));
+    memset(&nb->sun_, 0, sizeof(nb->sun_));
+    nb->sun_.sun_family = AF_UNIX;
+    snprintf(nb->sun_.sun_path, sizeof(nb->sun_.sun_path), "%s/_", tempdir);
+    RAND_bytes(nb->auth_token, sizeof(nb->auth_token));
     if ((listen_fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1) {
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "socket(2) failed:%s", strerror(errno));
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "socket(2) failed:%s", strerror(errno));
         goto Fail;
     }
-    if (bind(listen_fd, (void *)&psep->sun_, sizeof(psep->sun_)) != 0) {
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "failed to bind to %s:%s", psep->sun_.sun_path, strerror(errno));
+    if (bind(listen_fd, (void *)&nb->sun_, sizeof(nb->sun_)) != 0) {
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "failed to bind to %s:%s", nb->sun_.sun_path, strerror(errno));
         goto Fail;
     }
     if (listen(listen_fd, SOMAXCONN) != 0) {
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "listen(2) failed:%s", strerror(errno));
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "listen(2) failed:%s", strerror(errno));
         goto Fail;
     }
     switch (fork()) {
     case -1:
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "fork(2) failed:%s", strerror(errno));
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "fork(2) failed:%s", strerror(errno));
         goto Fail;
     case 0:
         close(pipe_fds[1]);
-        memcpy(daemon_auth_token, psep->auth_token, OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE);
+        memcpy(daemon_auth_token, nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE);
         daemon_main(listen_fd, pipe_fds[0], tempdir);
         break;
     default:
@@ -809,17 +809,17 @@ int openssl_privsep_init(openssl_privsep_t *psep, char *errbuf)
     pipe_fds[0] = -1;
 
     /* setup engine */
-    if ((psep->engine = ENGINE_new()) == NULL ||
-        !ENGINE_set_id(psep->engine, "privsep") ||
-        !ENGINE_set_name(psep->engine, "privilege separation software engine") ||
-        !ENGINE_set_RSA(psep->engine, &rsa_method)) {
-        snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "failed to initialize the OpenSSL engine");
+    if ((nb->engine = ENGINE_new()) == NULL ||
+        !ENGINE_set_id(nb->engine, "neverbleed") ||
+        !ENGINE_set_name(nb->engine, "privilege separation software engine") ||
+        !ENGINE_set_RSA(nb->engine, &rsa_method)) {
+        snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "failed to initialize the OpenSSL engine");
         goto Fail;
     }
-    ENGINE_add(psep->engine);
+    ENGINE_add(nb->engine);
 
     /* setup thread key */
-    pthread_key_create(&psep->thread_key, dispose_thread_data);
+    pthread_key_create(&nb->thread_key, dispose_thread_data);
 
     free(tempdir);
     return 0;
@@ -834,9 +834,9 @@ Fail:
     }
     if (listen_fd != -1)
         close(listen_fd);
-    if (psep->engine != NULL) {
-        ENGINE_free(psep->engine);
-        psep->engine = NULL;
+    if (nb->engine != NULL) {
+        ENGINE_free(nb->engine);
+        nb->engine = NULL;
     }
     return -1;
 }
