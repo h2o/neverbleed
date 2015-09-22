@@ -17,7 +17,7 @@ On my Linux VM running on Core i7 @ 2.4GHz (MacBook Pro 15" Late 2013), OpenSSL 
 
 ### Q. Why does the library only protect the private keys?
 
-Because private keys are the only _long-term_ secret being used.
+Because private keys are the only _long-term_ secret being used for encrypting and/or digitally-signing the communication.
 
 Depending on how OpenSSL is used it might be benefitial to separate symmetric cipher operations or TLS operations as a whole.  But even in such case it would still be a good idea to isolate private key operations from them considering the impact of private key leaks.
 
