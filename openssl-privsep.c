@@ -594,6 +594,47 @@ Respond:
     return 0;
 }
 
+int openssl_privsep_setuid(openssl_privsep_t *psep, uid_t uid)
+{
+    struct st_openssl_privsep_thread_data_t *thdata = get_thread_data(psep);
+    struct expbuf_t buf = {};
+    size_t ret;
+
+    expbuf_push_str(&buf, "setuid");
+    expbuf_push_num(&buf, uid);
+    if (expbuf_write(&buf, thdata->fd) != 0)
+        dief(errno != 0 ? "write error" : "connection closed by daemon");
+    expbuf_dispose(&buf);
+
+    if (expbuf_read(&buf, thdata->fd) != 0)
+        dief(errno != 0 ? "read error" : "connection closed by daemon");
+    if (expbuf_shift_num(&buf, &ret) != 0) {
+        errno = 0;
+        dief("failed to parse response");
+    }
+    expbuf_dispose(&buf);
+
+    return (int)ret;
+}
+
+static int setuid_stub(struct expbuf_t *buf)
+{
+    size_t uid;
+    int ret;
+
+    if (expbuf_shift_num(buf, &uid) != 0) {
+        errno = 0;
+        warnf("%s: failed to parse request", __FUNCTION__);
+        return -1;
+    }
+    ret = setuid((uid_t)uid);
+    expbuf_dispose(buf);
+
+    expbuf_push_num(buf, ret);
+
+    return 0;
+}
+
 __attribute__((noreturn))
 static void *daemon_close_notify_thread(void *_close_notify_fd)
 {
@@ -650,6 +691,9 @@ static void *daemon_conn_thread(void *_sock_fd)
                 break;
         } else if (strcmp(cmd, "load_key") == 0) {
             if (load_key_stub(&buf) != 0)
+                break;
+        } else if (strcmp(cmd, "setuid") == 0) {
+            if (setuid_stub(&buf) != 0)
                 break;
         } else {
             warnf("unknown command:%s", cmd);

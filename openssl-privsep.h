@@ -48,6 +48,10 @@ int openssl_privsep_init(openssl_privsep_t *psep, char *errbuf);
  * loads a private key file (returns 0 if successful, -1 if failed)
  */
 int openssl_privsep_load_private_key_file(openssl_privsep_t *psep, SSL_CTX *ctx, const char *fn, char *errbuf);
+/**
+ * setuid
+ */
+int openssl_privsep_setuid(openssl_privsep_t *psep, uid_t uid);
 
 #ifdef __cplusplus
 }
