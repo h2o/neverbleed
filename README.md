@@ -60,3 +60,5 @@ the privilege separation engine will be used for all the incoming TLS connection
     ...
   }
 ```
+
+Also, `neverbleed_setuid` function can be used to drop the privileges of the daemon process once it completes loading all the private keys.
