@@ -31,11 +31,13 @@ extern "C" {
 #endif
 
 #define OPENSSL_PRIVSEP_ERRBUF_SIZE (256)
+#define OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE 32
 
 typedef struct st_openssl_privsep_t {
     ENGINE *engine;
     struct sockaddr_un sun_;
     pthread_key_t thread_key;
+    unsigned char auth_token[OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE];
 } openssl_privsep_t;
 
 /**

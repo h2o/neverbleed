@@ -34,6 +34,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include "openssl-privsep.h"
 
@@ -271,6 +272,7 @@ void dispose_thread_data(void *_thdata)
 struct st_openssl_privsep_thread_data_t *get_thread_data(openssl_privsep_t *psep)
 {
     struct st_openssl_privsep_thread_data_t *thdata;
+    ssize_t r;
 
     if ((thdata = pthread_getspecific(psep->thread_key)) != NULL)
         return thdata;
@@ -282,7 +284,10 @@ struct st_openssl_privsep_thread_data_t *get_thread_data(openssl_privsep_t *psep
     while (connect(thdata->fd, (void *)&psep->sun_, sizeof(psep->sun_)) != 0)
         if (errno != EINTR)
             dief("failed to connect to privsep daemon");
-    /* TODO authenticate */
+    while ((r = write(thdata->fd, psep->auth_token, sizeof(psep->auth_token))) == -1 && errno == EINTR)
+        ;
+    if (r != sizeof(psep->auth_token))
+        dief("failed to send authentication token");
     pthread_setspecific(psep->thread_key, thdata);
 
     return thdata;
@@ -306,6 +311,8 @@ static struct {
 } daemon_rsa_keys = {
     PTHREAD_MUTEX_INITIALIZER
 };
+
+static unsigned char daemon_auth_token[OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE];
 
 static RSA *daemon_get_rsa(size_t key_index)
 {
@@ -608,6 +615,17 @@ static void *daemon_conn_thread(void *_sock_fd)
 {
     int sock_fd = (int)_sock_fd;
     struct expbuf_t buf = {};
+    unsigned char auth_token[OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE];
+
+    /* authenticate */
+    if (read_nbytes(sock_fd, &auth_token, sizeof(auth_token)) != 0) {
+        warnf("failed to receive authencication token from client");
+        goto Exit;
+    }
+    if (memcmp(auth_token, daemon_auth_token, OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE) != 0) {
+        warnf("client authentication failed");
+        goto Exit;
+    }
 
     while (1) {
         char *cmd;
@@ -644,6 +662,7 @@ static void *daemon_conn_thread(void *_sock_fd)
         expbuf_dispose(&buf);
     }
 
+Exit:
     expbuf_dispose(&buf);
     close(sock_fd);
 
@@ -715,6 +734,7 @@ int openssl_privsep_init(openssl_privsep_t *psep, char *errbuf)
     memset(&psep->sun_, 0, sizeof(psep->sun_));
     psep->sun_.sun_family = AF_UNIX;
     snprintf(psep->sun_.sun_path, sizeof(psep->sun_.sun_path), "%s/_", tempdir);
+    RAND_bytes(psep->auth_token, sizeof(psep->auth_token));
     if ((listen_fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1) {
         snprintf(errbuf, OPENSSL_PRIVSEP_ERRBUF_SIZE, "socket(2) failed:%s", strerror(errno));
         goto Fail;
@@ -733,6 +753,7 @@ int openssl_privsep_init(openssl_privsep_t *psep, char *errbuf)
         goto Fail;
     case 0:
         close(pipe_fds[1]);
+        memcpy(daemon_auth_token, psep->auth_token, OPENSSL_PRIVSEP_AUTH_TOKEN_SIZE);
         daemon_main(listen_fd, pipe_fds[0], tempdir);
         break;
     default:
