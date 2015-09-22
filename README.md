@@ -5,6 +5,22 @@ openssl-privsep is an OpenSSL engine that runs RSA private key operations in an 
 
 The engine can be used together with existing versions of OpenSSL or LibreSSL, with minimal changes to the server source code.
 
+FAQ
+---
+
+### Q. How much is the overhead?
+
+Virtually none.
+
+Generally speaking, private key operations are much more heavier than the overhead of inter-process communication.
+On my Linux VM running on Core i7 @ 2.4GHz (MacBook Pro 15" Late 2013), OpenSSL 1.0.2 without privilege separation processes 319.56 TLS handshakes per second, whereas OpenSSL with privilege separation processes 316.72 handshakes per second (note: RSA key length: 2,048 bits, selected cipher-suite: ECDHE-RSA-AES128-GCM-SHA256).
+
+### Q. Why does the library only separate private key operations?
+
+Because private keys are the only _long-term_ secret being used.
+
+Depending on how OpenSSL is used it might be benefitial to separate symmetric cipher operations or TLS operations as a whole.  But even in such case it would still be a good idea to isolate private key operations from them considering the impact of private key leaks.
+
 How-to
 ------
 
