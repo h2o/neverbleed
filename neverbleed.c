@@ -36,6 +36,9 @@
 #include <unistd.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include "neverbleed.h"
 
 struct expbuf_t {
@@ -794,6 +797,9 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         goto Fail;
     case 0:
         close(pipe_fds[1]);
+#ifdef __linux__
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
         memcpy(daemon_auth_token, nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE);
         daemon_main(listen_fd, pipe_fds[0], tempdir);
         break;
