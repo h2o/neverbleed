@@ -211,13 +211,10 @@ static int expbuf_write(struct expbuf_t *buf, int fd)
     for (vecindex = 0; vecindex != sizeof(vecs) / sizeof(vecs[0]);) {
         while ((r = writev(fd, vecs + vecindex, sizeof(vecs) / sizeof(vecs[0]) - vecindex)) == -1 && errno == EINTR)
             ;
-        if (r == -1) {
+        if (r == -1)
             return -1;
-        } else if (r == 0) {
-            errno = 0;
-            return -1;
-        }
-        while (r >= vecs[vecindex].iov_len) {
+        assert(r != 0);
+        while (r != 0 && r >= vecs[vecindex].iov_len) {
             r -= vecs[vecindex].iov_len;
             ++vecindex;
         }
