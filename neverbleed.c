@@ -392,11 +392,11 @@ static int priv_encdec_stub(const char *name,
         warnf("%s: invalid key index:%zu\n", name, key_index);
         return -1;
     }
-    ret = RSA_private_encrypt((int)flen, from, to, rsa, (int)padding);
+    ret = func((int)flen, from, to, rsa, (int)padding);
     expbuf_dispose(buf);
 
     expbuf_push_num(buf, ret);
-    expbuf_push_bytes(buf, to, ret == 1 ? flen : 0);
+    expbuf_push_bytes(buf, to, ret > 0 ? ret : 0);
 
     return 0;
 }
