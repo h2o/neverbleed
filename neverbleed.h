@@ -35,6 +35,7 @@ extern "C" {
 
 typedef struct st_neverbleed_t {
     ENGINE *engine;
+    pid_t daemon_pid;
     struct sockaddr_un sun_;
     pthread_key_t thread_key;
     unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
