@@ -843,7 +843,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "listen(2) failed:%s", strerror(errno));
         goto Fail;
     }
-    switch (fork()) {
+    nb->daemon_pid = fork();
+    switch (nb->daemon_pid) {
     case -1:
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "fork(2) failed:%s", strerror(errno));
         goto Fail;
