@@ -99,6 +99,12 @@ static void dief(const char *fmt, ...)
     abort();
 }
 
+static void set_cloexec(int fd)
+{
+    if (fcntl(fd, F_SETFD, O_CLOEXEC) == -1)
+        dief("failed to set O_CLOEXEC to fd %d", fd);
+}
+
 static int read_nbytes(int fd, void *p, size_t sz)
 {
     while (sz != 0) {
@@ -289,8 +295,14 @@ struct st_neverbleed_thread_data_t *get_thread_data(neverbleed_t *nb)
     }
 
     thdata->self_pid = self_pid;
+#ifdef SOCK_CLOEXEC
+    if ((thdata->fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) == -1)
+        dief("socket(2) failed");
+#else
     if ((thdata->fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1)
         dief("socket(2) failed");
+    set_cloexec(thdata->fd);
+#endif
     while (connect(thdata->fd, (void *)&nb->sun_, sizeof(nb->sun_)) != 0)
         if (errno != EINTR)
             dief("failed to connect to privsep daemon");
@@ -809,7 +821,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "pipe(2) failed:%s", strerror(errno));
         goto Fail;
     }
-    fcntl(pipe_fds[1], F_SETFD, O_CLOEXEC);
+    set_cloexec(pipe_fds[1]);
     if ((tempdir = strdup("/tmp/openssl-privsep.XXXXXX")) == NULL) {
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "no memory");
         goto Fail;
