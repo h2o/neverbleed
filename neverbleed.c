@@ -330,8 +330,8 @@ static struct {
         size_t size;
         RSA **keys;
     } keys;
-    unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
-} daemon_vars;
+    neverbleed_t *nb;
+} daemon_vars = {{PTHREAD_MUTEX_INITIALIZER}};
 
 static RSA *daemon_get_rsa(size_t key_index)
 {
@@ -614,7 +614,7 @@ Respond:
     return 0;
 }
 
-int neverbleed_setuidgid(neverbleed_t *nb, const char *user)
+int neverbleed_setuidgid(neverbleed_t *nb, const char *user, int change_socket_ownership)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     struct expbuf_t buf = {};
@@ -622,6 +622,7 @@ int neverbleed_setuidgid(neverbleed_t *nb, const char *user)
 
     expbuf_push_str(&buf, "setuidgid");
     expbuf_push_str(&buf, user);
+    expbuf_push_num(&buf, change_socket_ownership);
     if (expbuf_write(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "write error" : "connection closed by daemon");
     expbuf_dispose(&buf);
@@ -640,11 +641,12 @@ int neverbleed_setuidgid(neverbleed_t *nb, const char *user)
 static int setuidgid_stub(struct expbuf_t *buf)
 {
     const char *user;
+    size_t change_socket_ownership;
     struct passwd pwbuf, *pw;
     char pwstrbuf[65536]; /* should be large enough */
     int ret = -1;
 
-    if ((user = expbuf_shift_str(buf)) == NULL) {
+    if ((user = expbuf_shift_str(buf)) == NULL || expbuf_shift_num(buf, &change_socket_ownership) != 0) {
         errno = 0;
         warnf("%s: failed to parse request", __FUNCTION__);
         return -1;
@@ -659,6 +661,19 @@ static int setuidgid_stub(struct expbuf_t *buf)
         warnf("%s: failed to obtain information of user:%s", __FUNCTION__, user);
         goto Respond;
     }
+
+    if (change_socket_ownership) {
+        char *fn = strdup(daemon_vars.nb->sun_.sun_path);
+        if (fn == NULL)
+            dief("no memory");
+        if (chown(fn, pw->pw_uid, pw->pw_gid) != 0)
+            dief("chown failed");
+        /* change the dir ownership as well */
+        *strrchr(fn, '/') = '\0';
+        if (chown(fn, pw->pw_uid, pw->pw_gid) != 0)
+            dief("chown failed");
+    }
+
     /* setuidgid */
     if (setgid(pw->pw_gid) != 0) {
         warnf("%s: setgid(%d) failed", __FUNCTION__, (int)pw->pw_gid);
@@ -707,7 +722,7 @@ static void *daemon_conn_thread(void *_sock_fd)
         warnf("failed to receive authencication token from client");
         goto Exit;
     }
-    if (memcmp(auth_token, daemon_vars.auth_token, NEVERBLEED_AUTH_TOKEN_SIZE) != 0) {
+    if (memcmp(auth_token, daemon_vars.nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE) != 0) {
         warnf("client authentication failed");
         goto Exit;
     }
@@ -843,7 +858,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "listen(2) failed:%s", strerror(errno));
         goto Fail;
     }
-    switch (fork()) {
+    nb->daemon_pid = fork();
+    switch (nb->daemon_pid) {
     case -1:
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "fork(2) failed:%s", strerror(errno));
         goto Fail;
@@ -852,7 +868,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
 #ifdef __linux__
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 #endif
-        memcpy(daemon_vars.auth_token, nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE);
+        daemon_vars.nb = nb;
         daemon_main(listen_fd, pipe_fds[0], tempdir);
         break;
     default:
