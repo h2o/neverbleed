@@ -56,6 +56,7 @@ struct st_neverbleed_rsa_exdata_t {
 };
 
 struct st_neverbleed_thread_data_t {
+    pid_t self_pid;
     int fd;
 };
 
@@ -274,13 +275,20 @@ void dispose_thread_data(void *_thdata)
 struct st_neverbleed_thread_data_t *get_thread_data(neverbleed_t *nb)
 {
     struct st_neverbleed_thread_data_t *thdata;
+    pid_t self_pid = getpid();
     ssize_t r;
 
-    if ((thdata = pthread_getspecific(nb->thread_key)) != NULL)
-        return thdata;
+    if ((thdata = pthread_getspecific(nb->thread_key)) != NULL) {
+        if (thdata->self_pid == self_pid)
+            return thdata;
+        /* we have been forked! */
+        close(thdata->fd);
+    } else {
+        if ((thdata = malloc(sizeof(*thdata))) == NULL)
+            dief("malloc failed");
+    }
 
-    if ((thdata = malloc(sizeof(*thdata))) == NULL)
-        dief("malloc failed");
+    thdata->self_pid = self_pid;
     if ((thdata->fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1)
         dief("socket(2) failed");
     while (connect(thdata->fd, (void *)&nb->sun_, sizeof(nb->sun_)) != 0)
