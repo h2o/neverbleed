@@ -327,22 +327,21 @@ static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t *
 }
 
 static struct {
-    pthread_mutex_t lock;
-    size_t size;
-    RSA **keys;
-} daemon_rsa_keys = {
-    PTHREAD_MUTEX_INITIALIZER
-};
-
-static unsigned char daemon_auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
+    struct {
+        pthread_mutex_t lock;
+        size_t size;
+        RSA **keys;
+    } keys;
+    unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
+} daemon_vars;
 
 static RSA *daemon_get_rsa(size_t key_index)
 {
     RSA *rsa;
 
-    pthread_mutex_lock(&daemon_rsa_keys.lock);
-    rsa = daemon_rsa_keys.keys[key_index];
-    pthread_mutex_unlock(&daemon_rsa_keys.lock);
+    pthread_mutex_lock(&daemon_vars.keys.lock);
+    rsa = daemon_vars.keys.keys[key_index];
+    pthread_mutex_unlock(&daemon_vars.keys.lock);
 
     return rsa;
 }
@@ -351,13 +350,14 @@ static size_t daemon_set_rsa(RSA *rsa)
 {
     size_t index;
 
-    pthread_mutex_lock(&daemon_rsa_keys.lock);
-    if ((daemon_rsa_keys.keys = realloc(daemon_rsa_keys.keys, sizeof(*daemon_rsa_keys.keys) * (daemon_rsa_keys.size + 1))) == NULL)
+    pthread_mutex_lock(&daemon_vars.keys.lock);
+    if ((daemon_vars.keys.keys = realloc(daemon_vars.keys.keys, sizeof(*daemon_vars.keys.keys) * (daemon_vars.keys.size + 1))) ==
+        NULL)
         dief("no memory");
-    index = daemon_rsa_keys.size++;
-    daemon_rsa_keys.keys[index] = rsa;
+    index = daemon_vars.keys.size++;
+    daemon_vars.keys.keys[index] = rsa;
     RSA_up_ref(rsa);
-    pthread_mutex_unlock(&daemon_rsa_keys.lock);
+    pthread_mutex_unlock(&daemon_vars.keys.lock);
 
     return index;
 }
@@ -661,6 +661,7 @@ static int setuidgid_stub(struct expbuf_t *buf)
         warnf("%s: failed to obtain information of user:%s", __FUNCTION__, user);
         goto Respond;
     }
+    /* setuidgid */
     if (setgid(pw->pw_gid) != 0) {
         warnf("%s: setgid(%d) failed", __FUNCTION__, (int)pw->pw_gid);
         goto Respond;
@@ -709,7 +710,7 @@ static void *daemon_conn_thread(void *_sock_fd)
         warnf("failed to receive authencication token from client");
         goto Exit;
     }
-    if (memcmp(auth_token, daemon_auth_token, NEVERBLEED_AUTH_TOKEN_SIZE) != 0) {
+    if (memcmp(auth_token, daemon_vars.auth_token, NEVERBLEED_AUTH_TOKEN_SIZE) != 0) {
         warnf("client authentication failed");
         goto Exit;
     }
@@ -855,7 +856,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
 #ifdef __linux__
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 #endif
-        memcpy(daemon_auth_token, nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE);
+        memcpy(daemon_vars.auth_token, nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE);
         daemon_main(listen_fd, pipe_fds[0], tempdir);
         break;
     default:
