@@ -50,9 +50,9 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf);
  */
 int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf);
 /**
- * setuidgid
+ * setuidgid (also changes the file permissions so that `user` can connect to the daemon, if change_socket_ownership is non-zero)
  */
-int neverbleed_setuidgid(neverbleed_t *nb, const char *user);
+int neverbleed_setuidgid(neverbleed_t *nb, const char *user, int change_socket_ownership);
 
 #ifdef __cplusplus
 }
