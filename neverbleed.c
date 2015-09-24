@@ -77,8 +77,7 @@ static void warnvf(const char *fmt, va_list args)
     fputc('\n', stderr);
 }
 
-__attribute__((format(printf, 1, 2)))
-static void warnf(const char *fmt, ...)
+__attribute__((format(printf, 1, 2))) static void warnf(const char *fmt, ...)
 {
     va_list args;
 
@@ -87,8 +86,7 @@ static void warnf(const char *fmt, ...)
     va_end(args);
 }
 
-__attribute__((format(printf, 1, 2), noreturn))
-static void dief(const char *fmt, ...)
+__attribute__((format(printf, 1, 2), noreturn)) static void dief(const char *fmt, ...)
 {
     va_list args;
 
@@ -682,8 +680,7 @@ Respond:
     return 0;
 }
 
-__attribute__((noreturn))
-static void *daemon_close_notify_thread(void *_close_notify_fd)
+__attribute__((noreturn)) static void *daemon_close_notify_thread(void *_close_notify_fd)
 {
     int close_notify_fd = (int)((char *)_close_notify_fd - (char *)NULL);
     char b;
@@ -760,8 +757,7 @@ Exit:
     return NULL;
 }
 
-__attribute__((noreturn))
-static void daemon_main(int listen_fd, int close_notify_fd, const char *tempdir)
+__attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notify_fd, const char *tempdir)
 {
     pthread_t tid;
     pthread_attr_t thattr;
@@ -791,20 +787,20 @@ static void daemon_main(int listen_fd, int close_notify_fd, const char *tempdir)
 }
 
 static RSA_METHOD rsa_method = {
-    "privsep RSA method",
-    NULL, /* rsa_pub_enc */
-    NULL, /* rsa_pub_dec */
-    priv_enc_proxy, /* rsa_priv_enc */
-    priv_dec_proxy, /* rsa_priv_dec */
-    NULL, /* rsa_mod_exp */
-    NULL, /* bn_mod_exp */
-    NULL, /* init */
-    NULL, /* finish */
-    RSA_FLAG_SIGN_VER, /* flags */
-    NULL, /* app data */
-    sign_proxy, /* rsa_sign */
-    NULL, /* rsa_verify */
-    NULL /* rsa_keygen */
+    "privsep RSA method", /* name */
+    NULL,                 /* rsa_pub_enc */
+    NULL,                 /* rsa_pub_dec */
+    priv_enc_proxy,       /* rsa_priv_enc */
+    priv_dec_proxy,       /* rsa_priv_dec */
+    NULL,                 /* rsa_mod_exp */
+    NULL,                 /* bn_mod_exp */
+    NULL,                 /* init */
+    NULL,                 /* finish */
+    RSA_FLAG_SIGN_VER,    /* flags */
+    NULL,                 /* app data */
+    sign_proxy,           /* rsa_sign */
+    NULL,                 /* rsa_verify */
+    NULL                  /* rsa_keygen */
 };
 
 int neverbleed_init(neverbleed_t *nb, char *errbuf)
@@ -868,10 +864,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     pipe_fds[0] = -1;
 
     /* setup engine */
-    if ((nb->engine = ENGINE_new()) == NULL ||
-        !ENGINE_set_id(nb->engine, "neverbleed") ||
-        !ENGINE_set_name(nb->engine, "privilege separation software engine") ||
-        !ENGINE_set_RSA(nb->engine, &rsa_method)) {
+    if ((nb->engine = ENGINE_new()) == NULL || !ENGINE_set_id(nb->engine, "neverbleed") ||
+        !ENGINE_set_name(nb->engine, "privilege separation software engine") || !ENGINE_set_RSA(nb->engine, &rsa_method)) {
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "failed to initialize the OpenSSL engine");
         goto Fail;
     }
