@@ -38,6 +38,8 @@
 #include <unistd.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
+#include <openssl/rsa.h>
+#include <openssl/bn.h>
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -830,7 +832,11 @@ static RSA_METHOD rsa_method = {
     NULL,                 /* bn_mod_exp */
     NULL,                 /* init */
     NULL,                 /* finish */
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100001L
+    0,                    /* flags */
+#else
     RSA_FLAG_SIGN_VER,    /* flags */
+#endif
     NULL,                 /* app data */
     sign_proxy,           /* rsa_sign */
     NULL,                 /* rsa_verify */
@@ -842,7 +848,11 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     int pipe_fds[2] = {-1, -1}, listen_fd = -1;
     char *tempdir = NULL;
 
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100001L
+    const RSA_METHOD *default_method = RSA_PKCS1_OpenSSL();
+#else
     const RSA_METHOD *default_method = RSA_PKCS1_SSLeay();
+#endif
     rsa_method.rsa_pub_enc = default_method->rsa_pub_enc;
     rsa_method.rsa_pub_dec = default_method->rsa_pub_dec;
     rsa_method.rsa_verify = default_method->rsa_verify;
