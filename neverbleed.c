@@ -524,11 +524,50 @@ static int sign_stub(struct expbuf_t *buf)
     return 0;
 }
 
+#if defined(LIBRESSL_VERSION_NUMBER) || OPENSSL_VERSION_NUMBER < 0x10100005L
+static void RSA_get0_key(const RSA *rsa, BIGNUM **n, BIGNUM **e, BIGNUM **d)
+{
+    if (n) {
+        *n = rsa->n;
+    }
+
+    if (e) {
+        *e = rsa->e;
+    }
+
+    if (d) {
+        *d = rsa->d;
+    }
+}
+
+static int RSA_set0_key(RSA *rsa, BIGNUM *n, BIGNUM *e, BIGNUM *d)
+{
+    if (n == NULL || e == NULL) {
+        return 0;
+    }
+
+    BN_free(rsa->n);
+    BN_free(rsa->e);
+    BN_free(rsa->d);
+    rsa->n = n;
+    rsa->e = e;
+    rsa->d = d;
+
+    return 1;
+}
+
+static void RSA_set_flags(RSA *r, int flags)
+{
+    r->flags |= flags;
+}
+#endif
+
 static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebuf, const char *nbuf)
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
     RSA *rsa;
     EVP_PKEY *pkey;
+    BIGNUM *e = NULL, *n = NULL;
 
     if ((exdata = malloc(sizeof(*exdata))) == NULL) {
         fprintf(stderr, "no memory\n");
@@ -539,15 +578,16 @@ static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebu
 
     rsa = RSA_new_method(nb->engine);
     RSA_set_ex_data(rsa, 0, exdata);
-    if (BN_hex2bn(&rsa->e, ebuf) == 0) {
+    if (BN_hex2bn(&e, ebuf) == 0) {
         fprintf(stderr, "failed to parse e:%s\n", ebuf);
         abort();
     }
-    if (BN_hex2bn(&rsa->n, nbuf) == 0) {
+    if (BN_hex2bn(&n, nbuf) == 0) {
         fprintf(stderr, "failed to parse n:%s\n", nbuf);
         abort();
     }
-    rsa->flags |= RSA_FLAG_EXT_PKEY;
+    RSA_set0_key(rsa, n, e, NULL);
+    RSA_set_flags(rsa, RSA_FLAG_EXT_PKEY);
 
     pkey = EVP_PKEY_new();
     EVP_PKEY_set1_RSA(pkey, rsa);
@@ -556,7 +596,7 @@ static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebu
     return pkey;
 }
 
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100002L
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100005L
 
 static EC_KEY *daemon_get_ecdsa(size_t key_index)
 {
@@ -748,7 +788,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
         }
         pkey = create_pkey(nb, key_index, estr, nstr);
         break;
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100002L
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100005L
     case NEVERBLEED_TYPE_ECDSA:
         if (expbuf_shift_num(&buf, &curve_name) != 0 || (ec_pubkeystr = expbuf_shift_str(&buf)) == NULL) {
             errno = 0;
@@ -794,6 +834,7 @@ static int load_key_stub(struct expbuf_t *buf)
     const EC_POINT *ec_pubkey;
     BIGNUM *ec_pubkeybn = NULL;
     char *ec_pubkeystr = NULL;
+    BIGNUM *e, *n;
 
     if ((fn = expbuf_shift_str(buf)) == NULL) {
         warnf("%s: failed to parse request", __FUNCTION__);
@@ -810,16 +851,17 @@ static int load_key_stub(struct expbuf_t *buf)
         goto Respond;
     }
 
-    switch (EVP_PKEY_type(pkey->type)) {
+    switch (EVP_PKEY_base_id(pkey)) {
     case EVP_PKEY_RSA:
         rsa = EVP_PKEY_get1_RSA(pkey);
         type = NEVERBLEED_TYPE_RSA;
         key_index = daemon_set_rsa(rsa);
-        estr = BN_bn2hex(rsa->e);
-        nstr = BN_bn2hex(rsa->n);
+        RSA_get0_key(rsa, &n, &e, NULL);
+        estr = BN_bn2hex(e);
+        nstr = BN_bn2hex(n);
         break;
     case EVP_PKEY_EC:
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100002L
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100005L
         ec_key = EVP_PKEY_get0_EC_KEY(pkey);
         type = NEVERBLEED_TYPE_ECDSA;
         key_index = daemon_set_ecdsa(ec_key);
@@ -838,7 +880,7 @@ static int load_key_stub(struct expbuf_t *buf)
         goto Respond;
 #endif
     default:
-        snprintf(errbuf, sizeof(errbuf), "unsupported private key: %d", EVP_PKEY_type(pkey->type));
+        snprintf(errbuf, sizeof(errbuf), "unsupported private key: %d", EVP_PKEY_base_id(pkey));
         goto Respond;
     }
 
@@ -1013,7 +1055,7 @@ static void *daemon_conn_thread(void *_sock_fd)
         } else if (strcmp(cmd, "sign") == 0) {
             if (sign_stub(&buf) != 0)
                 break;
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100002L
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100005L
         } else if (strcmp(cmd, "ecdsa_sign") == 0) {
             if (ecdsa_sign_stub(&buf) != 0)
                 break;
@@ -1071,7 +1113,9 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
     }
 }
 
-static RSA_METHOD rsa_method = {
+#if defined(LIBRESSL_VERSION_NUMBER) || OPENSSL_VERSION_NUMBER < 0x10100005L
+
+static RSA_METHOD static_rsa_method = {
     "privsep RSA method", /* name */
     NULL,                 /* rsa_pub_enc */
     NULL,                 /* rsa_pub_dec */
@@ -1081,7 +1125,7 @@ static RSA_METHOD rsa_method = {
     NULL,                 /* bn_mod_exp */
     NULL,                 /* init */
     NULL,                 /* finish */
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100002L
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100005L
     0,                    /* flags */
 #else
     RSA_FLAG_SIGN_VER,    /* flags */
@@ -1092,31 +1136,41 @@ static RSA_METHOD rsa_method = {
     NULL                  /* rsa_keygen */
 };
 
+#endif
+
 int neverbleed_init(neverbleed_t *nb, char *errbuf)
 {
     int pipe_fds[2] = {-1, -1}, listen_fd = -1;
     char *tempdir = NULL;
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100002L
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100005L
     const RSA_METHOD *default_method = RSA_PKCS1_OpenSSL();
     EC_KEY_METHOD *ecdsa_method;
     const EC_KEY_METHOD *ecdsa_default_method;
-#else
-    const RSA_METHOD *default_method = RSA_PKCS1_SSLeay();
-#endif
+    RSA_METHOD *rsa_method = RSA_meth_new("privsep RSA method", 0);
 
-    rsa_method.rsa_pub_enc = default_method->rsa_pub_enc;
-    rsa_method.rsa_pub_dec = default_method->rsa_pub_dec;
-    rsa_method.rsa_verify = default_method->rsa_verify;
+    RSA_meth_set_priv_enc(rsa_method, priv_enc_proxy);
+    RSA_meth_set_priv_dec(rsa_method, priv_dec_proxy);
+    RSA_meth_set_sign(rsa_method, sign_proxy);
 
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100002L
+    RSA_meth_set_pub_enc(rsa_method, RSA_meth_get_pub_enc(default_method));
+    RSA_meth_set_pub_dec(rsa_method, RSA_meth_get_pub_dec(default_method));
+    RSA_meth_set_verify(rsa_method, RSA_meth_get_verify(default_method));
+
+    /* setup EC_KEY_METHOD for ECDSA */
     ecdsa_default_method = EC_KEY_get_default_method();
     ecdsa_method = EC_KEY_METHOD_new(ecdsa_default_method);
 
-    /* setup EC_KEY_METHOD for ECDSA */
     EC_KEY_METHOD_set_keygen(ecdsa_method, NULL);
     EC_KEY_METHOD_set_compute_key(ecdsa_method, NULL);
     /* it seems sign_sig and sign_setup is not used in TLS ECDSA. */
     EC_KEY_METHOD_set_sign(ecdsa_method, ecdsa_sign_proxy, NULL, NULL);
+#else
+    const RSA_METHOD *default_method = RSA_PKCS1_SSLeay();
+    RSA_METHOD *rsa_method = &static_rsa_method;
+
+    rsa_method->rsa_pub_enc = default_method->rsa_pub_enc;
+    rsa_method->rsa_pub_dec = default_method->rsa_pub_dec;
+    rsa_method->rsa_verify = default_method->rsa_verify;
 #endif
 
     /* setup the daemon */
@@ -1172,8 +1226,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
 
     /* setup engine */
     if ((nb->engine = ENGINE_new()) == NULL || !ENGINE_set_id(nb->engine, "neverbleed") ||
-        !ENGINE_set_name(nb->engine, "privilege separation software engine") || !ENGINE_set_RSA(nb->engine, &rsa_method)
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100002L
+        !ENGINE_set_name(nb->engine, "privilege separation software engine") || !ENGINE_set_RSA(nb->engine, rsa_method)
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100005L
         || !ENGINE_set_EC(nb->engine, ecdsa_method)
 #endif
             ) {
