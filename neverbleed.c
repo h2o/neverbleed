@@ -247,7 +247,7 @@ static int expbuf_write(struct expbuf_t *buf, int fd)
             ++vecindex;
         }
         if (r != 0) {
-            vecs[vecindex].iov_base += r;
+            vecs[vecindex].iov_base = (char *)vecs[vecindex].iov_base + r;
             vecs[vecindex].iov_len -= r;
         }
     }
