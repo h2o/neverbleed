@@ -228,7 +228,7 @@ static void *expbuf_shift_bytes(struct expbuf_t *buf, size_t *l)
 
 static int expbuf_write(struct expbuf_t *buf, int fd)
 {
-    struct iovec vecs[2] = {};
+    struct iovec vecs[2] = {{NULL}};
     size_t bufsz = expbuf_size(buf);
     int vecindex;
     ssize_t r;
@@ -249,7 +249,7 @@ static int expbuf_write(struct expbuf_t *buf, int fd)
             ++vecindex;
         }
         if (r != 0) {
-            vecs[vecindex].iov_base += r;
+            vecs[vecindex].iov_base = (char *)vecs[vecindex].iov_base + r;
             vecs[vecindex].iov_len -= r;
         }
     }
@@ -387,7 +387,7 @@ static int priv_encdec_proxy(const char *cmd, int flen, const unsigned char *fro
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
     struct st_neverbleed_thread_data_t *thdata;
-    struct expbuf_t buf = {};
+    struct expbuf_t buf = {NULL};
     size_t ret;
     unsigned char *to;
     size_t tolen;
@@ -469,7 +469,7 @@ static int sign_proxy(int type, const unsigned char *m, unsigned int m_len, unsi
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
     struct st_neverbleed_thread_data_t *thdata;
-    struct expbuf_t buf = {};
+    struct expbuf_t buf = {NULL};
     size_t ret, siglen;
     unsigned char *sigret;
 
@@ -760,7 +760,7 @@ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve
 int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
-    struct expbuf_t buf = {};
+    struct expbuf_t buf = {NULL};
     size_t ret, key_index, type;
     char *estr, *nstr, *errstr;
     EVP_PKEY *pkey;
@@ -922,7 +922,7 @@ Respond:
 int neverbleed_setuidgid(neverbleed_t *nb, const char *user, int change_socket_ownership)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
-    struct expbuf_t buf = {};
+    struct expbuf_t buf = {NULL};
     size_t ret;
 
     expbuf_push_str(&buf, "setuidgid");
@@ -1021,7 +1021,7 @@ Redo:
 static void *daemon_conn_thread(void *_sock_fd)
 {
     int sock_fd = (int)((char *)_sock_fd - (char *)NULL);
-    struct expbuf_t buf = {};
+    struct expbuf_t buf = {NULL};
     unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
 
     /* authenticate */
