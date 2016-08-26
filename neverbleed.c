@@ -525,7 +525,7 @@ static int sign_stub(struct expbuf_t *buf)
 }
 
 #if defined(LIBRESSL_VERSION_NUMBER) || OPENSSL_VERSION_NUMBER < 0x10100005L
-static void RSA_get0_key(const RSA *rsa, BIGNUM **n, BIGNUM **e, BIGNUM **d)
+static void RSA_get0_key(const RSA *rsa, const BIGNUM **n, const BIGNUM **e, const BIGNUM **d)
 {
     if (n) {
         *n = rsa->n;
@@ -834,7 +834,7 @@ static int load_key_stub(struct expbuf_t *buf)
     const EC_POINT *ec_pubkey;
     BIGNUM *ec_pubkeybn = NULL;
     char *ec_pubkeystr = NULL;
-    BIGNUM *e, *n;
+    const BIGNUM *e, *n;
 
     if ((fn = expbuf_shift_str(buf)) == NULL) {
         warnf("%s: failed to parse request", __FUNCTION__);
