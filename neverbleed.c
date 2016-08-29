@@ -45,7 +45,7 @@
 #endif
 #include "neverbleed.h"
 
-#define OPENSSL_101_API (!defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x1010000fL)
+#define OPENSSL_1_1_API (!defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x1010000fL)
 
 enum neverbleed_type { NEVERBLEED_TYPE_NONE, NEVERBLEED_TYPE_RSA, NEVERBLEED_TYPE_ECDSA };
 
@@ -526,7 +526,7 @@ static int sign_stub(struct expbuf_t *buf)
     return 0;
 }
 
-#if !OPENSSL_101_API
+#if !OPENSSL_1_1_API
 
 static void RSA_get0_key(const RSA *rsa, const BIGNUM **n, const BIGNUM **e, const BIGNUM **d)
 {
@@ -599,7 +599,7 @@ static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebu
     return pkey;
 }
 
-#if OPENSSL_101_API
+#if OPENSSL_1_1_API
 
 static EC_KEY *daemon_get_ecdsa(size_t key_index)
 {
@@ -791,7 +791,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
         }
         pkey = create_pkey(nb, key_index, estr, nstr);
         break;
-#if OPENSSL_101_API
+#if OPENSSL_1_1_API
     case NEVERBLEED_TYPE_ECDSA:
         if (expbuf_shift_num(&buf, &curve_name) != 0 || (ec_pubkeystr = expbuf_shift_str(&buf)) == NULL) {
             errno = 0;
@@ -864,7 +864,7 @@ static int load_key_stub(struct expbuf_t *buf)
         nstr = BN_bn2hex(n);
         break;
     case EVP_PKEY_EC:
-#if OPENSSL_101_API
+#if OPENSSL_1_1_API
         ec_key = EVP_PKEY_get0_EC_KEY(pkey);
         type = NEVERBLEED_TYPE_ECDSA;
         key_index = daemon_set_ecdsa(ec_key);
@@ -1058,7 +1058,7 @@ static void *daemon_conn_thread(void *_sock_fd)
         } else if (strcmp(cmd, "sign") == 0) {
             if (sign_stub(&buf) != 0)
                 break;
-#if OPENSSL_101_API
+#if OPENSSL_1_1_API
         } else if (strcmp(cmd, "ecdsa_sign") == 0) {
             if (ecdsa_sign_stub(&buf) != 0)
                 break;
@@ -1116,7 +1116,7 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
     }
 }
 
-#if !OPENSSL_101_API
+#if !OPENSSL_1_1_API
 
 static RSA_METHOD static_rsa_method = {
     "privsep RSA method", /* name */
@@ -1141,7 +1141,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
 {
     int pipe_fds[2] = {-1, -1}, listen_fd = -1;
     char *tempdir = NULL;
-#if OPENSSL_101_API
+#if OPENSSL_1_1_API
     const RSA_METHOD *default_method = RSA_PKCS1_OpenSSL();
     EC_KEY_METHOD *ecdsa_method;
     const EC_KEY_METHOD *ecdsa_default_method;
@@ -1226,7 +1226,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     /* setup engine */
     if ((nb->engine = ENGINE_new()) == NULL || !ENGINE_set_id(nb->engine, "neverbleed") ||
         !ENGINE_set_name(nb->engine, "privilege separation software engine") || !ENGINE_set_RSA(nb->engine, rsa_method)
-#if OPENSSL_101_API
+#if OPENSSL_1_1_API
         || !ENGINE_set_EC(nb->engine, ecdsa_method)
 #endif
             ) {
