@@ -765,10 +765,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     struct expbuf_t buf = {NULL};
     size_t ret, key_index, type;
-    char *estr, *nstr, *errstr;
     EVP_PKEY *pkey;
-    char *ec_pubkeystr;
-    size_t curve_name;
 
     expbuf_push_str(&buf, "load_key");
     expbuf_push_str(&buf, fn);
@@ -784,23 +781,32 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
     }
 
     switch (type) {
-    case NEVERBLEED_TYPE_RSA:
+    case NEVERBLEED_TYPE_RSA: {
+        char *estr, *nstr;
+
         if ((estr = expbuf_shift_str(&buf)) == NULL || (nstr = expbuf_shift_str(&buf)) == NULL) {
             errno = 0;
             dief("failed to parse response");
         }
         pkey = create_pkey(nb, key_index, estr, nstr);
         break;
+    }
 #if OPENSSL_1_1_API
-    case NEVERBLEED_TYPE_ECDSA:
+    case NEVERBLEED_TYPE_ECDSA: {
+        char *ec_pubkeystr;
+        size_t curve_name;
+
         if (expbuf_shift_num(&buf, &curve_name) != 0 || (ec_pubkeystr = expbuf_shift_str(&buf)) == NULL) {
             errno = 0;
             dief("failed to parse response");
         }
         pkey = ecdsa_create_pkey(nb, key_index, curve_name, ec_pubkeystr);
         break;
+    }
 #endif
-    default:
+    default: {
+        char *errstr;
+
         if ((errstr = expbuf_shift_str(&buf)) == NULL) {
             errno = 0;
             dief("failed to parse response");
@@ -809,6 +815,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
         assert(ret != 1);
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "%s", errstr);
         return -1;
+    }
     }
 
     expbuf_dispose(&buf);
@@ -831,13 +838,10 @@ static int load_key_stub(struct expbuf_t *buf)
     size_t key_index = SIZE_MAX;
     char *estr = NULL, *nstr = NULL, errbuf[NEVERBLEED_ERRBUF_SIZE] = "";
     size_t type = NEVERBLEED_TYPE_NONE;
-    EC_KEY *ec_key = NULL;
-    EVP_PKEY *pkey;
+    EVP_PKEY *pkey = NULL;
     const EC_GROUP *ec_group;
-    const EC_POINT *ec_pubkey;
     BIGNUM *ec_pubkeybn = NULL;
     char *ec_pubkeystr = NULL;
-    const BIGNUM *e, *n;
 
     if ((fn = expbuf_shift_str(buf)) == NULL) {
         warnf("%s: failed to parse request", __FUNCTION__);
@@ -855,7 +859,9 @@ static int load_key_stub(struct expbuf_t *buf)
     }
 
     switch (EVP_PKEY_base_id(pkey)) {
-    case EVP_PKEY_RSA:
+    case EVP_PKEY_RSA: {
+        const BIGNUM *e, *n;
+
         rsa = EVP_PKEY_get1_RSA(pkey);
         type = NEVERBLEED_TYPE_RSA;
         key_index = daemon_set_rsa(rsa);
@@ -863,8 +869,12 @@ static int load_key_stub(struct expbuf_t *buf)
         estr = BN_bn2hex(e);
         nstr = BN_bn2hex(n);
         break;
-    case EVP_PKEY_EC:
+    }
+    case EVP_PKEY_EC: {
 #if OPENSSL_1_1_API
+        const EC_POINT *ec_pubkey;
+        EC_KEY *ec_key;
+
         ec_key = EVP_PKEY_get0_EC_KEY(pkey);
         type = NEVERBLEED_TYPE_ECDSA;
         key_index = daemon_set_ecdsa(ec_key);
@@ -882,6 +892,7 @@ static int load_key_stub(struct expbuf_t *buf)
         snprintf(errbuf, sizeof(errbuf), "ECDSA support requires OpenSSL >= 1.1.0");
         goto Respond;
 #endif
+    }
     default:
         snprintf(errbuf, sizeof(errbuf), "unsupported private key: %d", EVP_PKEY_base_id(pkey));
         goto Respond;
