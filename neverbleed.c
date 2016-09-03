@@ -47,7 +47,7 @@
 
 #define OPENSSL_1_1_API (!defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x1010000fL)
 
-enum neverbleed_type { NEVERBLEED_TYPE_NONE, NEVERBLEED_TYPE_RSA, NEVERBLEED_TYPE_ECDSA };
+enum neverbleed_type { NEVERBLEED_TYPE_ERROR, NEVERBLEED_TYPE_RSA, NEVERBLEED_TYPE_ECDSA };
 
 struct expbuf_t {
     char *buf;
@@ -764,7 +764,8 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     struct expbuf_t buf = {NULL};
-    size_t ret, key_index, type;
+    int ret = 1;
+    size_t key_index, type;
     EVP_PKEY *pkey;
 
     expbuf_push_str(&buf, "load_key");
@@ -775,7 +776,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
 
     if (expbuf_read(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "read error" : "connection closed by daemon");
-    if (expbuf_shift_num(&buf, &ret) != 0 || expbuf_shift_num(&buf, &type) != 0 || expbuf_shift_num(&buf, &key_index) != 0) {
+    if (expbuf_shift_num(&buf, &type) != 0 || expbuf_shift_num(&buf, &key_index) != 0) {
         errno = 0;
         dief("failed to parse response");
     }
@@ -812,7 +813,6 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
             dief("failed to parse response");
         }
 
-        assert(ret != 1);
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "%s", errstr);
         return -1;
     }
@@ -827,7 +827,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
     }
 
     EVP_PKEY_free(pkey);
-    return (int)ret;
+    return ret;
 }
 
 static int load_key_stub(struct expbuf_t *buf)
@@ -837,7 +837,7 @@ static int load_key_stub(struct expbuf_t *buf)
     RSA *rsa = NULL;
     size_t key_index = SIZE_MAX;
     char *estr = NULL, *nstr = NULL, errbuf[NEVERBLEED_ERRBUF_SIZE] = "";
-    size_t type = NEVERBLEED_TYPE_NONE;
+    size_t type = NEVERBLEED_TYPE_ERROR;
     EVP_PKEY *pkey = NULL;
     const EC_GROUP *ec_group;
     BIGNUM *ec_pubkeybn = NULL;
@@ -882,7 +882,7 @@ static int load_key_stub(struct expbuf_t *buf)
         ec_pubkey = EC_KEY_get0_public_key(ec_key);
         ec_pubkeybn = BN_new();
         if (!EC_POINT_point2bn(ec_group, ec_pubkey, POINT_CONVERSION_COMPRESSED, ec_pubkeybn, NULL)) {
-            type = NEVERBLEED_TYPE_NONE;
+            type = NEVERBLEED_TYPE_ERROR;
             snprintf(errbuf, sizeof(errbuf), "failed to convert ECDSA public key to BIGNUM");
             goto Respond;
         }
@@ -900,7 +900,6 @@ static int load_key_stub(struct expbuf_t *buf)
 
 Respond:
     expbuf_dispose(buf);
-    expbuf_push_num(buf, type != NEVERBLEED_TYPE_NONE);
     expbuf_push_num(buf, type);
     expbuf_push_num(buf, key_index);
     switch (type) {
