@@ -41,6 +41,14 @@ typedef struct st_neverbleed_t {
     unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
 } neverbleed_t;
 
+#define ROUND2WORD(n) (n + 64 - 1 - (n + 64 - 1) % 64)
+#define BITMASK(b) (1 << ((b) % CHAR_BIT))
+#define BITBYTE(b) ((b) / CHAR_BIT)
+#define BITSET(a, b) ((a)[BITBYTE(b)] |= BITMASK(b))
+#define BITUNSET(a, b) ((a)[BITBYTE(b)] &= ~BITMASK(b))
+#define BITBYTES(nb) ((nb + CHAR_BIT - 1) / CHAR_BIT)
+#define BITCHECK(a, b) ((a)[BITBYTE(b)] & BITMASK(b))
+
 /**
  * initializes the privilege separation engine (returns 0 if successful)
  */
@@ -48,7 +56,19 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf);
 /**
  * loads a private key file (returns 1 if successful)
  */
-int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf);
+int neverbleed_load_private_key_file_index(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf, size_t *key_index, size_t *type);
+static inline int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf) {
+    return neverbleed_load_private_key_file_index(nb, ctx, fn, errbuf, NULL, NULL);
+}
+
+/*
+ * deletes a private key at key index position (returns 1 if successful)
+ */
+int neverbleed_del_rsa_key(neverbleed_t *nb, const uint32_t key_index);
+#if (!defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x1010000fL)
+int neverbleed_del_ecdsa_key(neverbleed_t *nb, const uint32_t key_index);
+#endif
+
 /**
  * setuidgid (also changes the file permissions so that `user` can connect to the daemon, if change_socket_ownership is non-zero)
  */

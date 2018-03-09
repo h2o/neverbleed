@@ -368,13 +368,19 @@ static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t *
     *thdata = get_thread_data((*exdata)->nb);
 }
 
+static const size_t default_reserved_size = 8192;
+
 static struct {
     struct {
         pthread_mutex_t lock;
         size_t size;
+        size_t reserved_size;
         RSA **keys;
+        uint8_t *bita_keys;
         size_t ecdsa_size;
+        size_t reserved_ecdsa_size;
         EC_KEY **ecdsa_keys;
+        uint8_t *bita_ecdsa_keys;
     } keys;
     neverbleed_t *nb;
 } daemon_vars = {{PTHREAD_MUTEX_INITIALIZER}};
@@ -390,15 +396,62 @@ static RSA *daemon_get_rsa(size_t key_index)
     return rsa;
 }
 
+/*
+ *  Returns one plus the index of the least significant 1-bit of b within tot
+ *  or if not found, returns zero
+ */
+static uint32_t bita_ffirst(const uint8_t *b, const size_t tot, size_t bits)
+{
+    if (bits >= tot)
+        return 0;
+
+    uint64_t w = *((uint64_t *) b);
+    uint32_t r = __builtin_ffsll(w);
+    if (r)
+        return bits + r;
+
+    return bita_ffirst(&b[8], tot, bits + 64);
+}
+
+static size_t new_key_array_size(size_t size)
+{
+    return (size ? ROUND2WORD((size_t)(size * 0.50) + size) : default_reserved_size);
+}
+
+static uint8_t *bita_realloc(uint8_t *buf, size_t reserved_size, size_t size)
+{
+    uint8_t *b;
+    if ((b = realloc(buf, BITBYTES(size))) == NULL)
+        dief("no memory");
+
+    memset(&b[BITBYTES(reserved_size)], 0xff, BITBYTES(size - reserved_size));
+
+    return b;
+}
+
 static size_t daemon_set_rsa(RSA *rsa)
 {
-    size_t index;
-
     pthread_mutex_lock(&daemon_vars.keys.lock);
-    if ((daemon_vars.keys.keys = realloc(daemon_vars.keys.keys, sizeof(*daemon_vars.keys.keys) * (daemon_vars.keys.size + 1))) ==
-        NULL)
-        dief("no memory");
-    index = daemon_vars.keys.size++;
+
+    if (!daemon_vars.keys.reserved_size || (daemon_vars.keys.size >= daemon_vars.keys.reserved_size)) {
+        size_t size = new_key_array_size(daemon_vars.keys.reserved_size);
+        if ((daemon_vars.keys.keys = realloc(daemon_vars.keys.keys, sizeof(*daemon_vars.keys.keys) * size)) == NULL)
+            dief("no memory");
+
+        daemon_vars.keys.bita_keys = bita_realloc(daemon_vars.keys.bita_keys, daemon_vars.keys.reserved_size, size);
+        daemon_vars.keys.reserved_size = size;
+    }
+
+    size_t index = bita_ffirst(daemon_vars.keys.bita_keys, daemon_vars.keys.reserved_size, 0);
+
+    if (!index)
+        dief("no available slot for key");
+
+    --index; /* adjust result */
+    BITUNSET(daemon_vars.keys.bita_keys, index);
+
+    daemon_vars.keys.size++;
+    assert(daemon_vars.keys.keys[index] == NULL);
     daemon_vars.keys.keys[index] = rsa;
     RSA_up_ref(rsa);
     pthread_mutex_unlock(&daemon_vars.keys.lock);
@@ -635,13 +688,25 @@ static EC_KEY *daemon_get_ecdsa(size_t key_index)
 
 static size_t daemon_set_ecdsa(EC_KEY *ec_key)
 {
-    size_t index;
-
     pthread_mutex_lock(&daemon_vars.keys.lock);
-    if ((daemon_vars.keys.ecdsa_keys = realloc(daemon_vars.keys.ecdsa_keys,
-                                               sizeof(*daemon_vars.keys.ecdsa_keys) * (daemon_vars.keys.ecdsa_size + 1))) == NULL)
-        dief("no memory");
-    index = daemon_vars.keys.ecdsa_size++;
+    if (!daemon_vars.keys.reserved_ecdsa_size || (daemon_vars.keys.ecdsa_size >= daemon_vars.keys.reserved_ecdsa_size)) {
+        size_t size = new_key_array_size(daemon_vars.keys.reserved_ecdsa_size);
+        if ((daemon_vars.keys.keys = realloc(daemon_vars.keys.ecdsa_keys, sizeof(*daemon_vars.keys.ecdsa_keys) * size)) == NULL)
+            dief("no memory");
+
+        daemon_vars.keys.bita_ecdsa_keys = bita_realloc(daemon_vars.keys.bita_ecdsa_keys, daemon_vars.keys.reserved_ecdsa_size, size);
+        daemon_vars.keys.reserved_ecdsa_size = size;
+    }
+
+    size_t index = bita_ffirst(daemon_vars.keys.bita_ecdsa_keys, daemon_vars.keys.reserved_ecdsa_size, 0);
+
+    if (!index)
+        dief("no available slot for key");
+
+   --index; /* adjust result */
+    BITUNSET(daemon_vars.keys.bita_keys, index);
+
+    daemon_vars.keys.ecdsa_size++;
     daemon_vars.keys.ecdsa_keys[index] = ec_key;
     EC_KEY_up_ref(ec_key);
     pthread_mutex_unlock(&daemon_vars.keys.lock);
@@ -779,14 +844,74 @@ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve
     return pkey;
 }
 
+int neverbleed_del_ecdsa_key(neverbleed_t *nb, const uint32_t key_index)
+{
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
+    struct expbuf_t buf = {NULL};
+    size_t ret;
+
+    expbuf_push_str(&buf, "del_ecdsa_key");
+    expbuf_push_num(&buf, key_index);
+    if (expbuf_write(&buf, thdata->fd) != 0)
+        dief(errno != 0 ? "write error" : "connection closed by daemon");
+    expbuf_dispose(&buf);
+
+    if (expbuf_read(&buf, thdata->fd) != 0)
+        dief(errno != 0 ? "read error" : "connection closed by daemon");
+    if (expbuf_shift_num(&buf, &ret) != 0) {
+        errno = 0;
+        dief("failed to parse response");
+    }
+    expbuf_dispose(&buf);
+
+    return (int)ret;
+}
+
+static int del_ecdsa_key_stub(struct expbuf_t *buf)
+{
+    size_t key_index;
+    int ret = 0;
+
+    if (expbuf_shift_num(buf, &key_index) != 0) {
+        errno = 0;
+        warnf("%s: failed to parse request", __FUNCTION__);
+        return -1;
+    }
+
+    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.ecdsa_size) {
+        errno = 0;
+        warnf("%s: invalid key index %zu", __FUNCTION__, key_index);
+        goto respond;
+    }
+
+    if (BITCHECK(daemon_vars.keys.bita_ecdsa_keys, key_index)) {
+        warnf("%s: index not in use %zu", __FUNCTION__, key_index);
+        goto respond;
+    }
+
+    pthread_mutex_lock(&daemon_vars.keys.lock);
+    BITSET(daemon_vars.keys.bita_ecdsa_keys, key_index);
+    daemon_vars.keys.ecdsa_size--;
+    EC_KEY_free(daemon_vars.keys.ecdsa_keys[key_index]);
+    daemon_vars.keys.ecdsa_keys[key_index] = NULL;
+    pthread_mutex_unlock(&daemon_vars.keys.lock);
+
+    ret = 1;
+
+respond:
+    expbuf_dispose(buf);
+    expbuf_push_num(buf, ret);
+    return 0;
+}
+
 #endif
 
-int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf)
+int neverbleed_load_private_key_file_index(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf, size_t *key_index, size_t *key_type)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     struct expbuf_t buf = {NULL};
     int ret = 1;
-    size_t key_index, type;
+    size_t index, type;
     EVP_PKEY *pkey;
 
     expbuf_push_str(&buf, "load_key");
@@ -797,7 +922,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
 
     if (expbuf_read(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "read error" : "connection closed by daemon");
-    if (expbuf_shift_num(&buf, &type) != 0 || expbuf_shift_num(&buf, &key_index) != 0) {
+    if (expbuf_shift_num(&buf, &type) != 0 || expbuf_shift_num(&buf, &index) != 0) {
         errno = 0;
         dief("failed to parse response");
     }
@@ -810,7 +935,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
             errno = 0;
             dief("failed to parse response");
         }
-        pkey = create_pkey(nb, key_index, estr, nstr);
+        pkey = create_pkey(nb, index, estr, nstr);
         break;
     }
 #if OPENSSL_1_1_API
@@ -822,7 +947,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
             errno = 0;
             dief("failed to parse response");
         }
-        pkey = ecdsa_create_pkey(nb, key_index, curve_name, ec_pubkeystr);
+        pkey = ecdsa_create_pkey(nb, index, curve_name, ec_pubkeystr);
         break;
     }
 #endif
@@ -846,6 +971,9 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "SSL_CTX_use_PrivateKey failed");
         ret = 0;
     }
+
+    if (key_index) *key_index = index;
+    if (key_type) *key_type = type;
 
     EVP_PKEY_free(pkey);
     return ret;
@@ -1052,6 +1180,67 @@ Redo:
     _exit(0);
 }
 
+int neverbleed_del_rsa_key(neverbleed_t *nb, const uint32_t key_index)
+{
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
+    struct expbuf_t buf = {NULL};
+    size_t ret;
+
+    expbuf_push_str(&buf, "del_rsa_key");
+    expbuf_push_num(&buf, key_index);
+    if (expbuf_write(&buf, thdata->fd) != 0)
+        dief(errno != 0 ? "write error" : "connection closed by daemon");
+    expbuf_dispose(&buf);
+
+    if (expbuf_read(&buf, thdata->fd) != 0)
+        dief(errno != 0 ? "read error" : "connection closed by daemon");
+    if (expbuf_shift_num(&buf, &ret) != 0) {
+        errno = 0;
+        dief("failed to parse response");
+    }
+    expbuf_dispose(&buf);
+
+    return (int)ret;
+}
+
+static int del_rsa_key_stub(struct expbuf_t *buf)
+{
+    size_t key_index;
+
+    int ret = 0;
+
+    if (expbuf_shift_num(buf, &key_index) != 0) {
+        errno = 0;
+        warnf("%s: failed to parse request", __FUNCTION__);
+        return -1;
+    }
+
+    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.size) {
+        errno = 0;
+        warnf("%s: invalid key index %zu", __FUNCTION__, key_index);
+        goto respond;
+    }
+
+    if (BITCHECK(daemon_vars.keys.bita_keys, key_index)) {
+        warnf("%s: index not in use %zu", __FUNCTION__, key_index);
+        goto respond;
+    }
+
+    pthread_mutex_lock(&daemon_vars.keys.lock);
+    BITSET(daemon_vars.keys.bita_keys, key_index);
+    daemon_vars.keys.size--;
+    daemon_vars.keys.keys[key_index] = NULL;
+    RSA_free(daemon_vars.keys.keys[key_index]);
+    pthread_mutex_unlock(&daemon_vars.keys.lock);
+
+    ret = 1;
+
+respond:
+    expbuf_dispose(buf);
+    expbuf_push_num(buf, ret);
+    return 0;
+}
+
 static void *daemon_conn_thread(void *_sock_fd)
 {
     int sock_fd = (int)((char *)_sock_fd - (char *)NULL);
@@ -1093,9 +1282,15 @@ static void *daemon_conn_thread(void *_sock_fd)
         } else if (strcmp(cmd, "ecdsa_sign") == 0) {
             if (ecdsa_sign_stub(&buf) != 0)
                 break;
+        } else if (strcmp(cmd, "del_ecdsa_key") == 0) {
+            if (del_ecdsa_key_stub(&buf) != 0)
+                break;
 #endif
         } else if (strcmp(cmd, "load_key") == 0) {
             if (load_key_stub(&buf) != 0)
+                break;
+        } else if (strcmp(cmd, "del_rsa_key") == 0) {
+            if (del_rsa_key_stub(&buf) != 0)
                 break;
         } else if (strcmp(cmd, "setuidgid") == 0) {
             if (setuidgid_stub(&buf) != 0)
