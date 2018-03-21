@@ -451,7 +451,6 @@ static size_t daemon_set_rsa(RSA *rsa)
     BITUNSET(daemon_vars.keys.bita_keys, index);
 
     daemon_vars.keys.size++;
-    assert(daemon_vars.keys.keys[index] == NULL);
     daemon_vars.keys.keys[index] = rsa;
     RSA_up_ref(rsa);
     pthread_mutex_unlock(&daemon_vars.keys.lock);
@@ -844,7 +843,7 @@ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve
     return pkey;
 }
 
-int neverbleed_del_ecdsa_key(neverbleed_t *nb, const uint32_t key_index)
+int neverbleed_del_ecdsa_key(neverbleed_t *nb, const size_t key_index)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     struct expbuf_t buf = {NULL};
@@ -1180,7 +1179,7 @@ Redo:
     _exit(0);
 }
 
-int neverbleed_del_rsa_key(neverbleed_t *nb, const uint32_t key_index)
+int neverbleed_del_rsa_key(neverbleed_t *nb, const size_t key_index)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     struct expbuf_t buf = {NULL};

@@ -64,9 +64,9 @@ static inline int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ct
 /*
  * deletes a private key at key index position (returns 1 if successful)
  */
-int neverbleed_del_rsa_key(neverbleed_t *nb, const uint32_t key_index);
+int neverbleed_del_rsa_key(neverbleed_t *nb, const size_t key_index);
 #if (!defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x1010000fL)
-int neverbleed_del_ecdsa_key(neverbleed_t *nb, const uint32_t key_index);
+int neverbleed_del_ecdsa_key(neverbleed_t *nb, const size_t key_index);
 #endif
 
 /**
