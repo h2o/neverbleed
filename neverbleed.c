@@ -877,7 +877,7 @@ static int del_ecdsa_key_stub(struct expbuf_t *buf)
         return -1;
     }
 
-    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.ecdsa_size) {
+    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.reserved_ecdsa_size) {
         errno = 0;
         warnf("%s: invalid key index %zu", __FUNCTION__, key_index);
         goto respond;
@@ -1214,7 +1214,7 @@ static int del_rsa_key_stub(struct expbuf_t *buf)
         return -1;
     }
 
-    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.size) {
+    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.reserved_size) {
         errno = 0;
         warnf("%s: invalid key index %zu", __FUNCTION__, key_index);
         goto respond;
@@ -1228,8 +1228,8 @@ static int del_rsa_key_stub(struct expbuf_t *buf)
     pthread_mutex_lock(&daemon_vars.keys.lock);
     BITSET(daemon_vars.keys.bita_keys, key_index);
     daemon_vars.keys.size--;
-    daemon_vars.keys.keys[key_index] = NULL;
     RSA_free(daemon_vars.keys.keys[key_index]);
+    daemon_vars.keys.keys[key_index] = NULL;
     pthread_mutex_unlock(&daemon_vars.keys.lock);
 
     ret = 1;
