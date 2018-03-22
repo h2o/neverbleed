@@ -391,6 +391,8 @@ static RSA *daemon_get_rsa(size_t key_index)
 
     pthread_mutex_lock(&daemon_vars.keys.lock);
     rsa = daemon_vars.keys.keys[key_index];
+    if (rsa)
+        RSA_up_ref(rsa);
     pthread_mutex_unlock(&daemon_vars.keys.lock);
 
     return rsa;
@@ -512,6 +514,7 @@ static int priv_encdec_stub(const char *name,
     }
     ret = func((int)flen, from, to, rsa, (int)padding);
     expbuf_dispose(buf);
+    RSA_free(rsa);
 
     expbuf_push_num(buf, ret);
     expbuf_push_bytes(buf, to, ret > 0 ? ret : 0);
@@ -592,6 +595,7 @@ static int sign_stub(struct expbuf_t *buf)
     }
     ret = RSA_sign((int)type, m, (unsigned)m_len, sigret, &siglen, rsa);
     expbuf_dispose(buf);
+    RSA_free(rsa);
 
     expbuf_push_num(buf, ret);
     expbuf_push_bytes(buf, sigret, ret == 1 ? siglen : 0);
@@ -680,6 +684,8 @@ static EC_KEY *daemon_get_ecdsa(size_t key_index)
 
     pthread_mutex_lock(&daemon_vars.keys.lock);
     ec_key = daemon_vars.keys.ecdsa_keys[key_index];
+    if (ec_key)
+        EC_KEY_up_ref(ec_key);
     pthread_mutex_unlock(&daemon_vars.keys.lock);
 
     return ec_key;
@@ -735,6 +741,8 @@ static int ecdsa_sign_stub(struct expbuf_t *buf)
 
     ret = ECDSA_sign((int)type, m, (unsigned)m_len, sigret, &siglen, ec_key);
     expbuf_dispose(buf);
+
+    EC_KEY_free(ec_key);
 
     expbuf_push_num(buf, ret);
     expbuf_push_bytes(buf, sigret, ret == 1 ? siglen : 0);
