@@ -370,17 +370,23 @@ static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t *
 
 static const size_t default_reserved_size = 8192;
 
+struct key_slots {
+    size_t size;
+    size_t reserved_size;
+    /* bit array slots:
+     *   1-bit slot available
+     *   0-bit slot unavailable
+     */
+    uint8_t *bita_avail;
+};
+
 static struct {
     struct {
         pthread_mutex_t lock;
-        size_t size;
-        size_t reserved_size;
         RSA **keys;
-        uint8_t *bita_keys;
-        size_t ecdsa_size;
-        size_t reserved_ecdsa_size;
+        struct key_slots rsa_slots;
         EC_KEY **ecdsa_keys;
-        uint8_t *bita_ecdsa_keys;
+        struct key_slots ecdsa_slots;
     } keys;
     neverbleed_t *nb;
 } daemon_vars = {{PTHREAD_MUTEX_INITIALIZER}};
@@ -399,60 +405,58 @@ static RSA *daemon_get_rsa(size_t key_index)
 }
 
 /*
- *  Returns one plus the index of the least significant 1-bit of b within tot
- *  or if not found, returns zero
+ *  Returns an available slot in bit array B
+ *  or if not found, returns SIZE_MAX
  */
-static uint32_t bita_ffirst(const uint8_t *b, const size_t tot, size_t bits)
+static size_t bita_ffirst(const uint8_t *b, const size_t tot, size_t bits)
 {
     if (bits >= tot)
-        return 0;
+        return SIZE_MAX;
 
     uint64_t w = *((uint64_t *) b);
+    /* __builtin_ffsll returns one plus the index of the least significant 1-bit, or zero if not found */
     uint32_t r = __builtin_ffsll(w);
     if (r)
-        return bits + r;
+        return bits + r - 1; /* adjust result */
 
     return bita_ffirst(&b[8], tot, bits + 64);
 }
 
-static size_t new_key_array_size(size_t size)
+static void adjust_slots_reserved_size(struct key_slots *slots)
 {
-    return (size ? ROUND2WORD((size_t)(size * 0.50) + size) : default_reserved_size);
-}
+    if (!slots->reserved_size || (slots->size >= slots->reserved_size)) {
+        size_t size = slots->reserved_size ? ROUND2WORD((size_t)(slots->reserved_size * 0.50) + slots->reserved_size)
+                : default_reserved_size;
+        if ((daemon_vars.keys.keys = realloc(daemon_vars.keys.keys, sizeof(*daemon_vars.keys.keys) * size)) == NULL)
+            dief("no memory");
 
-static uint8_t *bita_realloc(uint8_t *buf, size_t reserved_size, size_t size)
-{
-    uint8_t *b;
-    if ((b = realloc(buf, BITBYTES(size))) == NULL)
-        dief("no memory");
+        uint8_t *b;
+        if ((b = realloc(slots->bita_avail, BITBYTES(size))) == NULL)
+            dief("no memory");
 
-    memset(&b[BITBYTES(reserved_size)], 0xff, BITBYTES(size - reserved_size));
+        /* set all bits to 1 making all slots available */
+        memset(&b[BITBYTES(slots->reserved_size)], 0xff, BITBYTES(size - slots->reserved_size));
 
-    return b;
+        slots->bita_avail = b;
+        slots->reserved_size = size;
+    }
 }
 
 static size_t daemon_set_rsa(RSA *rsa)
 {
     pthread_mutex_lock(&daemon_vars.keys.lock);
 
-    if (!daemon_vars.keys.reserved_size || (daemon_vars.keys.size >= daemon_vars.keys.reserved_size)) {
-        size_t size = new_key_array_size(daemon_vars.keys.reserved_size);
-        if ((daemon_vars.keys.keys = realloc(daemon_vars.keys.keys, sizeof(*daemon_vars.keys.keys) * size)) == NULL)
-            dief("no memory");
+    adjust_slots_reserved_size(&daemon_vars.keys.rsa_slots);
 
-        daemon_vars.keys.bita_keys = bita_realloc(daemon_vars.keys.bita_keys, daemon_vars.keys.reserved_size, size);
-        daemon_vars.keys.reserved_size = size;
-    }
+    size_t index = bita_ffirst(daemon_vars.keys.rsa_slots.bita_avail, daemon_vars.keys.rsa_slots.reserved_size, 0);
 
-    size_t index = bita_ffirst(daemon_vars.keys.bita_keys, daemon_vars.keys.reserved_size, 0);
-
-    if (!index)
+    if (index == SIZE_MAX)
         dief("no available slot for key");
 
-    --index; /* adjust result */
-    BITUNSET(daemon_vars.keys.bita_keys, index);
+    /* set slot as unavailable */
+    BITUNSET(daemon_vars.keys.rsa_slots.bita_avail, index);
 
-    daemon_vars.keys.size++;
+    daemon_vars.keys.rsa_slots.size++;
     daemon_vars.keys.keys[index] = rsa;
     RSA_up_ref(rsa);
     pthread_mutex_unlock(&daemon_vars.keys.lock);
@@ -694,24 +698,18 @@ static EC_KEY *daemon_get_ecdsa(size_t key_index)
 static size_t daemon_set_ecdsa(EC_KEY *ec_key)
 {
     pthread_mutex_lock(&daemon_vars.keys.lock);
-    if (!daemon_vars.keys.reserved_ecdsa_size || (daemon_vars.keys.ecdsa_size >= daemon_vars.keys.reserved_ecdsa_size)) {
-        size_t size = new_key_array_size(daemon_vars.keys.reserved_ecdsa_size);
-        if ((daemon_vars.keys.keys = realloc(daemon_vars.keys.ecdsa_keys, sizeof(*daemon_vars.keys.ecdsa_keys) * size)) == NULL)
-            dief("no memory");
 
-        daemon_vars.keys.bita_ecdsa_keys = bita_realloc(daemon_vars.keys.bita_ecdsa_keys, daemon_vars.keys.reserved_ecdsa_size, size);
-        daemon_vars.keys.reserved_ecdsa_size = size;
-    }
+    adjust_slots_reserved_size(&daemon_vars.keys.ecdsa_slots);
 
-    size_t index = bita_ffirst(daemon_vars.keys.bita_ecdsa_keys, daemon_vars.keys.reserved_ecdsa_size, 0);
+    size_t index = bita_ffirst(daemon_vars.keys.ecdsa_slots.bita_avail, daemon_vars.keys.ecdsa_slots.reserved_size, 0);
 
-    if (!index)
+    if (index == SIZE_MAX)
         dief("no available slot for key");
 
-   --index; /* adjust result */
-    BITUNSET(daemon_vars.keys.bita_keys, index);
+    /* set slot as unavailable */
+    BITUNSET(daemon_vars.keys.ecdsa_slots.bita_avail, index);
 
-    daemon_vars.keys.ecdsa_size++;
+    daemon_vars.keys.ecdsa_slots.size++;
     daemon_vars.keys.ecdsa_keys[index] = ec_key;
     EC_KEY_up_ref(ec_key);
     pthread_mutex_unlock(&daemon_vars.keys.lock);
@@ -885,20 +883,21 @@ static int del_ecdsa_key_stub(struct expbuf_t *buf)
         return -1;
     }
 
-    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.reserved_ecdsa_size) {
+    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.ecdsa_slots.reserved_size) {
         errno = 0;
         warnf("%s: invalid key index %zu", __FUNCTION__, key_index);
         goto respond;
     }
 
-    if (BITCHECK(daemon_vars.keys.bita_ecdsa_keys, key_index)) {
+    if (BITCHECK(daemon_vars.keys.ecdsa_slots.bita_avail, key_index)) {
         warnf("%s: index not in use %zu", __FUNCTION__, key_index);
         goto respond;
     }
 
     pthread_mutex_lock(&daemon_vars.keys.lock);
-    BITSET(daemon_vars.keys.bita_ecdsa_keys, key_index);
-    daemon_vars.keys.ecdsa_size--;
+    /* set slot as available */
+    BITSET(daemon_vars.keys.ecdsa_slots.bita_avail, key_index);
+    daemon_vars.keys.ecdsa_slots.size--;
     EC_KEY_free(daemon_vars.keys.ecdsa_keys[key_index]);
     daemon_vars.keys.ecdsa_keys[key_index] = NULL;
     pthread_mutex_unlock(&daemon_vars.keys.lock);
@@ -1222,20 +1221,21 @@ static int del_rsa_key_stub(struct expbuf_t *buf)
         return -1;
     }
 
-    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.reserved_size) {
+    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.rsa_slots.reserved_size) {
         errno = 0;
         warnf("%s: invalid key index %zu", __FUNCTION__, key_index);
         goto respond;
     }
 
-    if (BITCHECK(daemon_vars.keys.bita_keys, key_index)) {
+    if (BITCHECK(daemon_vars.keys.rsa_slots.bita_avail, key_index)) {
         warnf("%s: index not in use %zu", __FUNCTION__, key_index);
         goto respond;
     }
 
     pthread_mutex_lock(&daemon_vars.keys.lock);
-    BITSET(daemon_vars.keys.bita_keys, key_index);
-    daemon_vars.keys.size--;
+    /* set slot as available */
+    BITSET(daemon_vars.keys.rsa_slots.bita_avail, key_index);
+    daemon_vars.keys.rsa_slots.size--;
     RSA_free(daemon_vars.keys.keys[key_index]);
     daemon_vars.keys.keys[key_index] = NULL;
     pthread_mutex_unlock(&daemon_vars.keys.lock);
