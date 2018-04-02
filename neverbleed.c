@@ -422,13 +422,24 @@ static size_t bita_ffirst(const uint8_t *b, const size_t tot, size_t bits)
     return bita_ffirst(&b[8], tot, bits + 64);
 }
 
-static void adjust_slots_reserved_size(struct key_slots *slots)
+static void adjust_slots_reserved_size(int type, struct key_slots *slots)
 {
     if (!slots->reserved_size || (slots->size >= slots->reserved_size)) {
         size_t size = slots->reserved_size ? ROUND2WORD((size_t)(slots->reserved_size * 0.50) + slots->reserved_size)
                 : default_reserved_size;
-        if ((daemon_vars.keys.keys = realloc(daemon_vars.keys.keys, sizeof(*daemon_vars.keys.keys) * size)) == NULL)
-            dief("no memory");
+
+        switch (type) {
+        case NEVERBLEED_TYPE_RSA:
+            if ((daemon_vars.keys.keys = realloc(daemon_vars.keys.keys, sizeof(*daemon_vars.keys.keys) * size)) == NULL)
+                dief("no memory");
+            break;
+        case NEVERBLEED_TYPE_ECDSA:
+            if ((daemon_vars.keys.ecdsa_keys = realloc(daemon_vars.keys.ecdsa_keys, sizeof(*daemon_vars.keys.ecdsa_keys) * size)) == NULL)
+                dief("no memory");
+            break;
+        default:
+            dief("invalid type adjusting reserved");
+        }
 
         uint8_t *b;
         if ((b = realloc(slots->bita_avail, BITBYTES(size))) == NULL)
@@ -446,7 +457,7 @@ static size_t daemon_set_rsa(RSA *rsa)
 {
     pthread_mutex_lock(&daemon_vars.keys.lock);
 
-    adjust_slots_reserved_size(&daemon_vars.keys.rsa_slots);
+    adjust_slots_reserved_size(NEVERBLEED_TYPE_RSA, &daemon_vars.keys.rsa_slots);
 
     size_t index = bita_ffirst(daemon_vars.keys.rsa_slots.bita_avail, daemon_vars.keys.rsa_slots.reserved_size, 0);
 
@@ -699,7 +710,7 @@ static size_t daemon_set_ecdsa(EC_KEY *ec_key)
 {
     pthread_mutex_lock(&daemon_vars.keys.lock);
 
-    adjust_slots_reserved_size(&daemon_vars.keys.ecdsa_slots);
+    adjust_slots_reserved_size(NEVERBLEED_TYPE_ECDSA, &daemon_vars.keys.ecdsa_slots);
 
     size_t index = bita_ffirst(daemon_vars.keys.ecdsa_slots.bita_avail, daemon_vars.keys.ecdsa_slots.reserved_size, 0);
 
@@ -849,14 +860,18 @@ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve
     return pkey;
 }
 
-int neverbleed_del_ecdsa_key(neverbleed_t *nb, const size_t key_index)
+static void priv_ecdsa_finish(EC_KEY *key)
 {
-    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
+    struct st_neverbleed_rsa_exdata_t *exdata;
+    struct st_neverbleed_thread_data_t *thdata;
+
+    ecdsa_get_privsep_data(key, &exdata, &thdata);
+
     struct expbuf_t buf = {NULL};
     size_t ret;
 
     expbuf_push_str(&buf, "del_ecdsa_key");
-    expbuf_push_num(&buf, key_index);
+    expbuf_push_num(&buf, exdata->key_index);
     if (expbuf_write(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "write error" : "connection closed by daemon");
     expbuf_dispose(&buf);
@@ -868,8 +883,6 @@ int neverbleed_del_ecdsa_key(neverbleed_t *nb, const size_t key_index)
         dief("failed to parse response");
     }
     expbuf_dispose(&buf);
-
-    return (int)ret;
 }
 
 static int del_ecdsa_key_stub(struct expbuf_t *buf)
@@ -883,7 +896,7 @@ static int del_ecdsa_key_stub(struct expbuf_t *buf)
         return -1;
     }
 
-    if (!daemon_vars.keys.keys || key_index >= daemon_vars.keys.ecdsa_slots.reserved_size) {
+    if (!daemon_vars.keys.ecdsa_keys || key_index >= daemon_vars.keys.ecdsa_slots.reserved_size) {
         errno = 0;
         warnf("%s: invalid key index %zu", __FUNCTION__, key_index);
         goto respond;
@@ -912,7 +925,7 @@ respond:
 
 #endif
 
-int neverbleed_load_private_key_file_index(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf, size_t *key_index, size_t *key_type)
+int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     struct expbuf_t buf = {NULL};
@@ -977,9 +990,6 @@ int neverbleed_load_private_key_file_index(neverbleed_t *nb, SSL_CTX *ctx, const
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "SSL_CTX_use_PrivateKey failed");
         ret = 0;
     }
-
-    if (key_index) *key_index = index;
-    if (key_type) *key_type = type;
 
     EVP_PKEY_free(pkey);
     return ret;
@@ -1186,14 +1196,18 @@ Redo:
     _exit(0);
 }
 
-int neverbleed_del_rsa_key(neverbleed_t *nb, const size_t key_index)
+static int priv_rsa_finish(RSA *rsa)
 {
-    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
+    struct st_neverbleed_rsa_exdata_t *exdata;
+    struct st_neverbleed_thread_data_t *thdata;
+
+    get_privsep_data(rsa, &exdata, &thdata);
+
     struct expbuf_t buf = {NULL};
     size_t ret;
 
     expbuf_push_str(&buf, "del_rsa_key");
-    expbuf_push_num(&buf, key_index);
+    expbuf_push_num(&buf, exdata->key_index);
     if (expbuf_write(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "write error" : "connection closed by daemon");
     expbuf_dispose(&buf);
@@ -1360,7 +1374,7 @@ static RSA_METHOD static_rsa_method = {
     NULL,                 /* rsa_mod_exp */
     NULL,                 /* bn_mod_exp */
     NULL,                 /* init */
-    NULL,                 /* finish */
+    priv_rsa_finish,      /* finish */
     RSA_FLAG_SIGN_VER,    /* flags */
     NULL,                 /* app data */
     sign_proxy,           /* rsa_sign */
@@ -1388,6 +1402,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     RSA_meth_set_pub_dec(rsa_method, RSA_meth_get_pub_dec(default_method));
     RSA_meth_set_verify(rsa_method, RSA_meth_get_verify(default_method));
 
+    RSA_meth_set_finish(rsa_method, priv_rsa_finish);
+
     /* setup EC_KEY_METHOD for ECDSA */
     ecdsa_default_method = EC_KEY_get_default_method();
     ecdsa_method = EC_KEY_METHOD_new(ecdsa_default_method);
@@ -1396,6 +1412,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     EC_KEY_METHOD_set_compute_key(ecdsa_method, NULL);
     /* it seems sign_sig and sign_setup is not used in TLS ECDSA. */
     EC_KEY_METHOD_set_sign(ecdsa_method, ecdsa_sign_proxy, NULL, NULL);
+    EC_KEY_METHOD_set_init(ecdsa_method, NULL, priv_ecdsa_finish, NULL, NULL, NULL, NULL);
 #else
     const RSA_METHOD *default_method = RSA_PKCS1_SSLeay();
     RSA_METHOD *rsa_method = &static_rsa_method;
