@@ -51,7 +51,7 @@ int dumb_https_server(unsigned short port)
 {
     int listen_fd, conn_fd, reuse_flag;
     struct sockaddr_in sin = {};
-    SSL_CTX *ctx;
+    SSL_CTX *ctx = NULL;
 
     if ((listen_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
         fprintf(stderr, "failed to create socket:%s\n", strerror(errno));
