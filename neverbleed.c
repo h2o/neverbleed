@@ -422,11 +422,23 @@ static size_t bita_ffirst(const uint8_t *b, const size_t tot, size_t bits)
     return bita_ffirst(&b[8], tot, bits + 64);
 }
 
+/*
+ * bit operation helpers for the bit-array in key_slots
+ */
+#define BITMASK(b) (1 << ((b) % CHAR_BIT))
+#define BITBYTE(b) ((b) / CHAR_BIT)
+#define BITSET(a, b) ((a)[BITBYTE(b)] |= BITMASK(b))
+#define BITUNSET(a, b) ((a)[BITBYTE(b)] &= ~BITMASK(b))
+#define BITBYTES(nb) ((nb + CHAR_BIT - 1) / CHAR_BIT)
+#define BITCHECK(a, b) ((a)[BITBYTE(b)] & BITMASK(b))
+
 static void adjust_slots_reserved_size(int type, struct key_slots *slots)
 {
+#define ROUND2WORD(n) (n + 64 - 1 - (n + 64 - 1) % 64)
     if (!slots->reserved_size || (slots->size >= slots->reserved_size)) {
         size_t size = slots->reserved_size ? ROUND2WORD((size_t)(slots->reserved_size * 0.50) + slots->reserved_size)
                 : default_reserved_size;
+#undef ROUND2WORD
 
         switch (type) {
         case NEVERBLEED_TYPE_RSA:

@@ -41,14 +41,6 @@ typedef struct st_neverbleed_t {
     unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
 } neverbleed_t;
 
-#define ROUND2WORD(n) (n + 64 - 1 - (n + 64 - 1) % 64)
-#define BITMASK(b) (1 << ((b) % CHAR_BIT))
-#define BITBYTE(b) ((b) / CHAR_BIT)
-#define BITSET(a, b) ((a)[BITBYTE(b)] |= BITMASK(b))
-#define BITUNSET(a, b) ((a)[BITBYTE(b)] &= ~BITMASK(b))
-#define BITBYTES(nb) ((nb + CHAR_BIT - 1) / CHAR_BIT)
-#define BITCHECK(a, b) ((a)[BITBYTE(b)] & BITMASK(b))
-
 /**
  * initializes the privilege separation engine (returns 0 if successful)
  */
