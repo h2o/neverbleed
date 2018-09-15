@@ -1420,8 +1420,6 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     ecdsa_default_method = EC_KEY_get_default_method();
     ecdsa_method = EC_KEY_METHOD_new(ecdsa_default_method);
 
-    EC_KEY_METHOD_set_keygen(ecdsa_method, NULL);
-    EC_KEY_METHOD_set_compute_key(ecdsa_method, NULL);
     /* it seems sign_sig and sign_setup is not used in TLS ECDSA. */
     EC_KEY_METHOD_set_sign(ecdsa_method, ecdsa_sign_proxy, NULL, NULL);
     EC_KEY_METHOD_set_init(ecdsa_method, NULL, priv_ecdsa_finish, NULL, NULL, NULL, NULL);
