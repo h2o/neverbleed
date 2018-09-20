@@ -1404,16 +1404,12 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     const RSA_METHOD *default_method = RSA_PKCS1_OpenSSL();
     EC_KEY_METHOD *ecdsa_method;
     const EC_KEY_METHOD *ecdsa_default_method;
-    RSA_METHOD *rsa_method = RSA_meth_new("privsep RSA method", 0);
+    RSA_METHOD *rsa_method = RSA_meth_dup(RSA_PKCS1_OpenSSL());
 
+    RSA_meth_set1_name(rsa_method, "privsep RSA method");
     RSA_meth_set_priv_enc(rsa_method, priv_enc_proxy);
     RSA_meth_set_priv_dec(rsa_method, priv_dec_proxy);
     RSA_meth_set_sign(rsa_method, sign_proxy);
-
-    RSA_meth_set_pub_enc(rsa_method, RSA_meth_get_pub_enc(default_method));
-    RSA_meth_set_pub_dec(rsa_method, RSA_meth_get_pub_dec(default_method));
-    RSA_meth_set_verify(rsa_method, RSA_meth_get_verify(default_method));
-
     RSA_meth_set_finish(rsa_method, priv_rsa_finish);
 
     /* setup EC_KEY_METHOD for ECDSA */
@@ -1432,6 +1428,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     rsa_method->rsa_pub_enc = default_method->rsa_pub_enc;
     rsa_method->rsa_pub_dec = default_method->rsa_pub_dec;
     rsa_method->rsa_verify = default_method->rsa_verify;
+    rsa_method->bn_mod_exp = default_method->bn_mod_exp;
 #endif
 
     /* setup the daemon */
