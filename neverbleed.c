@@ -36,6 +36,15 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+#include <openssl/opensslv.h>
+
+#if (!defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x1010000fL)
+#define OPENSSL_1_1_API 1
+#else
+#define OPENSSL_1_1_API 0
+#endif
+
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/rsa.h>
@@ -45,11 +54,6 @@
 #endif
 #include "neverbleed.h"
 
-#if (!defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x1010000fL)
-#define OPENSSL_1_1_API 1
-#else
-#define OPENSSL_1_1_API 0
-#endif
 
 enum neverbleed_type { NEVERBLEED_TYPE_ERROR, NEVERBLEED_TYPE_RSA, NEVERBLEED_TYPE_ECDSA };
 
