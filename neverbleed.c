@@ -32,6 +32,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -54,17 +57,14 @@
 #define OPENSSL_EC_API 0
 #endif
 
-#include <openssl/rand.h>
-#include <openssl/ssl.h>
-#include <openssl/rsa.h>
 #include <openssl/bn.h>
 #if OPENSSL_EC_API
 #include <openssl/ec.h>
 #endif
+#include <openssl/rand.h>
+#include <openssl/rsa.h>
+#include <openssl/ssl.h>
 
-#ifdef __linux__
-#include <sys/prctl.h>
-#endif
 #include "neverbleed.h"
 
 enum neverbleed_type { NEVERBLEED_TYPE_ERROR, NEVERBLEED_TYPE_RSA, NEVERBLEED_TYPE_ECDSA };
