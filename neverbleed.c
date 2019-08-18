@@ -37,6 +37,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <openssl/opensslconf.h>
 #include <openssl/opensslv.h>
 
 #if (!defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x1010000fL)
@@ -45,15 +46,26 @@
 #define OPENSSL_1_1_API 0
 #endif
 
+/* LibreSSL lacks OPENSSL_NO_EC even if the EC APIs are not provided. */
+#if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(OPENSSL_NO_EC) \
+    && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER >= 0x2090100fL)
+#define OPENSSL_EC_API 1
+#else
+#define OPENSSL_EC_API 0
+#endif
+
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/rsa.h>
 #include <openssl/bn.h>
+#if OPENSSL_EC_API
+#include <openssl/ec.h>
+#endif
+
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
 #include "neverbleed.h"
-
 
 enum neverbleed_type { NEVERBLEED_TYPE_ERROR, NEVERBLEED_TYPE_RSA, NEVERBLEED_TYPE_ECDSA };
 
@@ -707,7 +719,7 @@ static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebu
     return pkey;
 }
 
-#if OPENSSL_1_1_API
+#if OPENSSL_EC_API
 
 static EC_KEY *daemon_get_ecdsa(size_t key_index)
 {
@@ -973,7 +985,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
         pkey = create_pkey(nb, index, estr, nstr);
         break;
     }
-#if OPENSSL_1_1_API
+#if OPENSSL_EC_API
     case NEVERBLEED_TYPE_ECDSA: {
         char *ec_pubkeystr;
         size_t curve_name;
@@ -1020,9 +1032,11 @@ static int load_key_stub(struct expbuf_t *buf)
     char *estr = NULL, *nstr = NULL, errbuf[NEVERBLEED_ERRBUF_SIZE] = "";
     size_t type = NEVERBLEED_TYPE_ERROR;
     EVP_PKEY *pkey = NULL;
+#if OPENSSL_EC_API
     const EC_GROUP *ec_group;
     BIGNUM *ec_pubkeybn = NULL;
     char *ec_pubkeystr = NULL;
+#endif
 
     if ((fn = expbuf_shift_str(buf)) == NULL) {
         warnf("%s: failed to parse request", __FUNCTION__);
@@ -1052,7 +1066,7 @@ static int load_key_stub(struct expbuf_t *buf)
         break;
     }
     case EVP_PKEY_EC: {
-#if OPENSSL_1_1_API
+#if OPENSSL_EC_API
         const EC_POINT *ec_pubkey;
         EC_KEY *ec_key;
 
@@ -1088,10 +1102,12 @@ Respond:
         expbuf_push_str(buf, estr != NULL ? estr : "");
         expbuf_push_str(buf, nstr != NULL ? nstr : "");
         break;
+#if OPENSSL_EC_API
     case NEVERBLEED_TYPE_ECDSA:
         expbuf_push_num(buf, EC_GROUP_get_curve_name(ec_group));
         expbuf_push_str(buf, ec_pubkeystr);
         break;
+#endif
     default:
         expbuf_push_str(buf, errbuf);
     }
@@ -1103,10 +1119,12 @@ Respond:
         OPENSSL_free(estr);
     if (nstr != NULL)
         OPENSSL_free(nstr);
+#if OPENSSL_EC_API
     if (ec_pubkeystr != NULL)
         OPENSSL_free(ec_pubkeystr);
     if (ec_pubkeybn != NULL)
         BN_free(ec_pubkeybn);
+#endif
     if (fp != NULL)
         fclose(fp);
 
@@ -1315,7 +1333,7 @@ static void *daemon_conn_thread(void *_sock_fd)
         } else if (strcmp(cmd, "sign") == 0) {
             if (sign_stub(&buf) != 0)
                 break;
-#if OPENSSL_1_1_API
+#if OPENSSL_EC_API
         } else if (strcmp(cmd, "ecdsa_sign") == 0) {
             if (ecdsa_sign_stub(&buf) != 0)
                 break;
@@ -1406,7 +1424,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     char *tempdir = NULL;
     const RSA_METHOD *default_method;
     RSA_METHOD *rsa_method;
-#if OPENSSL_1_1_API
+#if OPENSSL_EC_API
     EC_KEY_METHOD *ecdsa_method;
     const EC_KEY_METHOD *ecdsa_default_method;
 #endif
@@ -1420,14 +1438,6 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     RSA_meth_set_priv_dec(rsa_method, priv_dec_proxy);
     RSA_meth_set_sign(rsa_method, sign_proxy);
     RSA_meth_set_finish(rsa_method, priv_rsa_finish);
-
-    /* setup EC_KEY_METHOD for ECDSA */
-    ecdsa_default_method = EC_KEY_get_default_method();
-    ecdsa_method = EC_KEY_METHOD_new(ecdsa_default_method);
-
-    /* it seems sign_sig and sign_setup is not used in TLS ECDSA. */
-    EC_KEY_METHOD_set_sign(ecdsa_method, ecdsa_sign_proxy, NULL, NULL);
-    EC_KEY_METHOD_set_init(ecdsa_method, NULL, priv_ecdsa_finish, NULL, NULL, NULL, NULL);
 #else
     default_method = RSA_PKCS1_SSLeay();
     rsa_method = &static_rsa_method;
@@ -1436,6 +1446,15 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     rsa_method->rsa_pub_dec = default_method->rsa_pub_dec;
     rsa_method->rsa_verify = default_method->rsa_verify;
     rsa_method->bn_mod_exp = default_method->bn_mod_exp;
+#endif
+
+#if OPENSSL_EC_API
+    ecdsa_default_method = EC_KEY_get_default_method();
+    ecdsa_method = EC_KEY_METHOD_new(ecdsa_default_method);
+
+    /* it seems sign_sig and sign_setup is not used in TLS ECDSA. */
+    EC_KEY_METHOD_set_sign(ecdsa_method, ecdsa_sign_proxy, NULL, NULL);
+    EC_KEY_METHOD_set_init(ecdsa_method, NULL, priv_ecdsa_finish, NULL, NULL, NULL, NULL);
 #endif
 
     /* setup the daemon */
@@ -1492,7 +1511,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     /* setup engine */
     if ((nb->engine = ENGINE_new()) == NULL || !ENGINE_set_id(nb->engine, "neverbleed") ||
         !ENGINE_set_name(nb->engine, "privilege separation software engine") || !ENGINE_set_RSA(nb->engine, rsa_method)
-#if OPENSSL_1_1_API
+#if OPENSSL_EC_API
         || !ENGINE_set_EC(nb->engine, ecdsa_method)
 #endif
             ) {
