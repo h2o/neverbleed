@@ -1400,11 +1400,16 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
 {
     int pipe_fds[2] = {-1, -1}, listen_fd = -1;
     char *tempdir = NULL;
+    const RSA_METHOD *default_method;
+    RSA_METHOD *rsa_method;
 #if OPENSSL_1_1_API
-    const RSA_METHOD *default_method = RSA_PKCS1_OpenSSL();
     EC_KEY_METHOD *ecdsa_method;
     const EC_KEY_METHOD *ecdsa_default_method;
-    RSA_METHOD *rsa_method = RSA_meth_dup(RSA_PKCS1_OpenSSL());
+#endif
+
+#if OPENSSL_1_1_API
+    default_method = RSA_PKCS1_OpenSSL();
+    rsa_method = RSA_meth_dup(default_method);
 
     RSA_meth_set1_name(rsa_method, "privsep RSA method");
     RSA_meth_set_priv_enc(rsa_method, priv_enc_proxy);
@@ -1420,8 +1425,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     EC_KEY_METHOD_set_sign(ecdsa_method, ecdsa_sign_proxy, NULL, NULL);
     EC_KEY_METHOD_set_init(ecdsa_method, NULL, priv_ecdsa_finish, NULL, NULL, NULL, NULL);
 #else
-    const RSA_METHOD *default_method = RSA_PKCS1_SSLeay();
-    RSA_METHOD *rsa_method = &static_rsa_method;
+    default_method = RSA_PKCS1_SSLeay();
+    rsa_method = &static_rsa_method;
 
     rsa_method->rsa_pub_enc = default_method->rsa_pub_enc;
     rsa_method->rsa_pub_dec = default_method->rsa_pub_dec;
