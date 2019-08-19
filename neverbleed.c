@@ -1083,7 +1083,7 @@ static int load_key_stub(struct expbuf_t *buf)
         ec_pubkeystr = BN_bn2hex(ec_pubkeybn);
         break;
 #else
-        snprintf(errbuf, sizeof(errbuf), "ECDSA support requires OpenSSL >= 1.1.0");
+        snprintf(errbuf, sizeof(errbuf), "ECDSA support requires OpenSSL >= 1.1.0 or LibreSSL >= 2.9.1");
         goto Respond;
 #endif
     }
