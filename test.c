@@ -25,8 +25,11 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <openssl/crypto.h>
+
+#include <openssl/ec.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
+
 #include "neverbleed.h"
 
 static void setup_ecc_key(SSL_CTX *ssl_ctx)
@@ -100,6 +103,7 @@ int main(int argc, char **argv)
     int use_privsep;
 
     /* initialization */
+    /* FIXME: These APIs are deprecated in favor of OPENSSL_init_crypto in 1.1.0. */
     SSL_load_error_strings();
     SSL_library_init();
     OpenSSL_add_all_algorithms();
