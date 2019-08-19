@@ -43,7 +43,7 @@
 #include <openssl/opensslconf.h>
 #include <openssl/opensslv.h>
 
-#if (!defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x1010000fL)
+#if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(LIBRESSL_VERSION_NUMBER)
 #define OPENSSL_1_1_API 1
 #else
 #define OPENSSL_1_1_API 0
@@ -65,7 +65,8 @@
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
 
-#if !OPENSSL_1_1_API && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER < 0x2070000fL)
+#if OPENSSL_VERSION_NUMBER < 0x1010000fL \
+    || (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x2070000fL)
 
 static void RSA_get0_key(const RSA *rsa, const BIGNUM **n, const BIGNUM **e, const BIGNUM **d)
 {
