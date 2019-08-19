@@ -48,7 +48,6 @@
 #define NEVERBLEED_OPAQUE_RSA_METHOD
 #endif
 
-/* LibreSSL lacks OPENSSL_NO_EC even if the EC APIs are not provided. */
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(OPENSSL_NO_EC) \
     && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER >= 0x2090100fL)
 /* EC_KEY_METHOD and related APIs are avaliable, so ECDSA is enabled. */
