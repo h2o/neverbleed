@@ -65,6 +65,46 @@
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
 
+#if !OPENSSL_1_1_API && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER < 0x2070000fL)
+
+static void RSA_get0_key(const RSA *rsa, const BIGNUM **n, const BIGNUM **e, const BIGNUM **d)
+{
+    if (n) {
+        *n = rsa->n;
+    }
+
+    if (e) {
+        *e = rsa->e;
+    }
+
+    if (d) {
+        *d = rsa->d;
+    }
+}
+
+static int RSA_set0_key(RSA *rsa, BIGNUM *n, BIGNUM *e, BIGNUM *d)
+{
+    if (n == NULL || e == NULL) {
+        return 0;
+    }
+
+    BN_free(rsa->n);
+    BN_free(rsa->e);
+    BN_free(rsa->d);
+    rsa->n = n;
+    rsa->e = e;
+    rsa->d = d;
+
+    return 1;
+}
+
+static void RSA_set_flags(RSA *r, int flags)
+{
+    r->flags |= flags;
+}
+
+#endif
+
 #include "neverbleed.h"
 
 enum neverbleed_type { NEVERBLEED_TYPE_ERROR, NEVERBLEED_TYPE_RSA, NEVERBLEED_TYPE_ECDSA };
@@ -645,45 +685,6 @@ static int sign_stub(struct expbuf_t *buf)
 
     return 0;
 }
-
-#if !OPENSSL_1_1_API && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER < 0x2070000fL)
-
-static void RSA_get0_key(const RSA *rsa, const BIGNUM **n, const BIGNUM **e, const BIGNUM **d)
-{
-    if (n) {
-        *n = rsa->n;
-    }
-
-    if (e) {
-        *e = rsa->e;
-    }
-
-    if (d) {
-        *d = rsa->d;
-    }
-}
-
-static int RSA_set0_key(RSA *rsa, BIGNUM *n, BIGNUM *e, BIGNUM *d)
-{
-    if (n == NULL || e == NULL) {
-        return 0;
-    }
-
-    BN_free(rsa->n);
-    BN_free(rsa->e);
-    BN_free(rsa->d);
-    rsa->n = n;
-    rsa->e = e;
-    rsa->d = d;
-
-    return 1;
-}
-
-static void RSA_set_flags(RSA *r, int flags)
-{
-    r->flags |= flags;
-}
-#endif
 
 static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebuf, const char *nbuf)
 {
