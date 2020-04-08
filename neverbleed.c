@@ -1507,6 +1507,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     close(pipe_fds[0]);
     pipe_fds[0] = -1;
 
+#ifndef OPENSSL_NO_ENGINE
     /* setup engine */
     if ((nb->engine = ENGINE_new()) == NULL || !ENGINE_set_id(nb->engine, "neverbleed") ||
         !ENGINE_set_name(nb->engine, "privilege separation software engine") || !ENGINE_set_RSA(nb->engine, rsa_method)
@@ -1518,6 +1519,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         goto Fail;
     }
     ENGINE_add(nb->engine);
+#endif
 
     /* setup thread key */
     pthread_key_create(&nb->thread_key, dispose_thread_data);
@@ -1536,7 +1538,9 @@ Fail:
     if (listen_fd != -1)
         close(listen_fd);
     if (nb->engine != NULL) {
+#ifndef OPENSSL_NO_ENGINE
         ENGINE_free(nb->engine);
+#endif
         nb->engine = NULL;
     }
     return -1;
