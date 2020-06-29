@@ -993,7 +993,7 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
             errno = 0;
             dief("failed to parse response");
         }
-        pkey = ecdsa_create_pkey(nb, index, curve_name, ec_pubkeystr);
+        pkey = ecdsa_create_pkey(nb, index, (int)curve_name, ec_pubkeystr);
         break;
     }
 #endif
