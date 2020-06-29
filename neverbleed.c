@@ -1496,6 +1496,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
 #ifdef __linux__
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 #endif
+        if (neverbleed_post_fork_cb != NULL)
+            neverbleed_post_fork_cb();
         daemon_vars.nb = nb;
         daemon_main(listen_fd, pipe_fds[0], tempdir);
         break;
@@ -1541,3 +1543,5 @@ Fail:
     }
     return -1;
 }
+
+void (*neverbleed_post_fork_cb)(void) = NULL;
