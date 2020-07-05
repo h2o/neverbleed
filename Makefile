@@ -1,18 +1,18 @@
-CC?=    cc
-CFLAGS+=    -Wall -fsanitize=address -fstack-protector -g
-TARGET= neverbleed
-OBJS=   test.o neverbleed.o
-PREFIX?=    /usr/local
-
-LIBS=   -lpthread -lssl -lcrypto
+CC?=     cc
+CFLAGS+= -Wall -fsanitize=address -fstack-protector -g
+LIBS+=   -lpthread -lssl -lcrypto
+TARGET=  test-neverbleed
+OBJS=    test.o neverbleed.o
 
 all:    $(TARGET)
 
 .c.o:
 	$(CC) $(CFLAGS) -c $<
 
-neverbleed:	$(OBJS)
+$(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LIBS)
 
 clean:
-	rm -fr *.o $(TARGET)
+	rm -fr $(OBJS) $(TARGET)
+
+.PHONY: clean
