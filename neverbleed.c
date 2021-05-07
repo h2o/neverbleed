@@ -218,17 +218,17 @@ static void expbuf_reserve(struct expbuf_t *buf, size_t extra)
 {
     char *n;
 
-    if (extra <= buf->buf + buf->capacity - buf->end)
+    if (extra <= buf->buf - buf->end + buf->capacity)
         return;
 
     if (buf->capacity == 0)
         buf->capacity = 4096;
-    while (buf->buf + buf->capacity - buf->end < extra)
+    while (buf->buf - buf->end + buf->capacity < extra)
         buf->capacity *= 2;
     if ((n = realloc(buf->buf, buf->capacity)) == NULL)
         dief("realloc failed");
-    buf->start += n - buf->buf;
-    buf->end += n - buf->buf;
+    buf->start = n + (buf->start - buf->end);
+    buf->end = n + (buf->end - buf->buf);
     buf->buf = n;
 }
 
