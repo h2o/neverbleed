@@ -32,8 +32,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef __linux__
+#if defined(__linux__)
 #include <sys/prctl.h>
+#elif defined(__FreeBSD__)
+#include <sys/procctl.h>
+#elif defined(__sun)
+#include <priv.h>
 #endif
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -1522,8 +1526,13 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         goto Fail;
     case 0:
         close(pipe_fds[1]);
-#ifdef __linux__
+#if defined(__linux__)
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#elif defined(__FreeBSD__)
+	int dumpable = PROC_TRACE_CTL_DISABLE;
+	procctl(P_PID, 0, PROC_TRACE_CTL, &dumpable);
+#elif defined(__sun)
+	setpflags(__PROC_PROTECT, 1);
 #endif
         if (neverbleed_post_fork_cb != NULL)
             neverbleed_post_fork_cb();
