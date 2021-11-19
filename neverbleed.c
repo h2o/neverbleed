@@ -34,6 +34,8 @@
 #include <string.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
+#elif defined(__APPLE__)
+#include <sys/ptrace.h>
 #elif defined(__FreeBSD__)
 #include <sys/procctl.h>
 #elif defined(__sun)
@@ -1528,6 +1530,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         close(pipe_fds[1]);
 #if defined(__linux__)
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#elif defined(__APPLE__)
+	ptrace(PT_DENY_ATTACH, 0, 0, 0);
 #elif defined(__FreeBSD__)
 	int dumpable = PROC_TRACE_CTL_DISABLE;
 	procctl(P_PID, 0, PROC_TRACE_CTL, &dumpable);
