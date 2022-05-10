@@ -231,7 +231,7 @@ static void expbuf_reserve(struct expbuf_t *buf, size_t extra)
         buf->capacity *= 2;
     if ((n = realloc(buf->buf, buf->capacity)) == NULL)
         dief("realloc failed");
-    buf->start = n + (buf->start - buf->end);
+    buf->start = n + (buf->start - buf->buf);
     buf->end = n + (buf->end - buf->buf);
     buf->buf = n;
 }
