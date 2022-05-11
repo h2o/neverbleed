@@ -43,6 +43,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include <openssl/opensslconf.h>
 #include <openssl/opensslv.h>
@@ -1429,6 +1430,16 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
     }
 }
 
+static void set_signal_handler(int signo, void (*cb)(int signo))
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    sigemptyset(&action.sa_mask);
+    action.sa_handler = cb;
+    sigaction(signo, &action, NULL);
+}
+
 #ifndef NEVERBLEED_OPAQUE_RSA_METHOD
 
 static RSA_METHOD static_rsa_method = {
@@ -1528,12 +1539,14 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         close(pipe_fds[1]);
 #if defined(__linux__)
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
 #elif defined(__FreeBSD__)
 	int dumpable = PROC_TRACE_CTL_DISABLE;
 	procctl(P_PID, 0, PROC_TRACE_CTL, &dumpable);
 #elif defined(__sun)
 	setpflags(__PROC_PROTECT, 1);
 #endif
+        set_signal_handler(SIGTERM, SIG_IGN);
         if (neverbleed_post_fork_cb != NULL)
             neverbleed_post_fork_cb();
         daemon_vars.nb = nb;
