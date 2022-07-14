@@ -32,6 +32,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <unistd.h>
+#include <signal.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
 #elif defined(__APPLE__)
@@ -41,11 +46,6 @@
 #elif defined(__sun)
 #include <priv.h>
 #endif
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/uio.h>
-#include <unistd.h>
-#include <signal.h>
 
 #include <openssl/opensslconf.h>
 #include <openssl/opensslv.h>
