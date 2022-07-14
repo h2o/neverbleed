@@ -1076,7 +1076,7 @@ static int load_key_stub(struct expbuf_t *buf)
         const EC_POINT *ec_pubkey;
         EC_KEY *ec_key;
 
-        ec_key = EVP_PKEY_get0_EC_KEY(pkey);
+        ec_key = (EC_KEY *)EVP_PKEY_get0_EC_KEY(pkey);
         type = NEVERBLEED_TYPE_ECDSA;
         key_index = daemon_set_ecdsa(ec_key);
         ec_group = EC_KEY_get0_group(ec_key);
