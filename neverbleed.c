@@ -136,9 +136,19 @@ struct st_neverbleed_rsa_exdata_t {
 };
 
 struct st_neverbleed_thread_data_t {
+    int in_flight;
     pid_t self_pid;
     int fd;
 };
+
+void thdata_reset_in_flight(struct st_neverbleed_thread_data_t **_thdata)
+{
+    struct st_neverbleed_thread_data_t *thdata = *_thdata;
+    assert(thdata->in_flight);
+    thdata->in_flight = 0;
+}
+
+#define THDATA_IN_FLIGHT __attribute__ ((__cleanup__(thdata_reset_in_flight))) struct st_neverbleed_thread_data_t
 
 static void warnvf(const char *fmt, va_list args)
 {
@@ -386,6 +396,7 @@ void dispose_thread_data(void *_thdata)
     assert(thdata->fd >= 0);
     close(thdata->fd);
     thdata->fd = -1;
+    free(thdata);
 }
 
 struct st_neverbleed_thread_data_t *get_thread_data(neverbleed_t *nb)
@@ -396,7 +407,7 @@ struct st_neverbleed_thread_data_t *get_thread_data(neverbleed_t *nb)
 
     if ((thdata = pthread_getspecific(nb->thread_key)) != NULL) {
         if (thdata->self_pid == self_pid)
-            return thdata;
+            goto Return;
         /* we have been forked! */
         close(thdata->fd);
     } else {
@@ -404,7 +415,8 @@ struct st_neverbleed_thread_data_t *get_thread_data(neverbleed_t *nb)
             dief("malloc failed");
     }
 
-    thdata->self_pid = self_pid;
+        thdata->in_flight = 0;
+        thdata->self_pid = self_pid;
 #ifdef SOCK_CLOEXEC
     if ((thdata->fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) == -1)
         dief("socket(2) failed");
@@ -422,6 +434,9 @@ struct st_neverbleed_thread_data_t *get_thread_data(neverbleed_t *nb)
         dief("failed to send authentication token");
     pthread_setspecific(nb->thread_key, thdata);
 
+Return:
+    assert(!thdata->in_flight);
+    thdata->in_flight = 1;
     return thdata;
 }
 
@@ -596,7 +611,7 @@ static int async_pause(int fd)
 static int priv_encdec_proxy(const char *cmd, int flen, const unsigned char *from, unsigned char *_to, RSA *rsa, int padding)
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
+    THDATA_IN_FLIGHT *thdata;
     struct expbuf_t buf = {NULL};
     size_t ret;
     unsigned char *to;
@@ -681,7 +696,7 @@ static int sign_proxy(int type, const unsigned char *m, unsigned int m_len, unsi
                       const RSA *rsa)
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
+    THDATA_IN_FLIGHT *thdata;
     struct expbuf_t buf = {NULL};
     size_t ret, siglen;
     unsigned char *sigret;
@@ -857,7 +872,7 @@ static int ecdsa_sign_proxy(int type, const unsigned char *m, int m_len, unsigne
                             const BIGNUM *kinv, const BIGNUM *rp, EC_KEY *ec_key)
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
+    THDATA_IN_FLIGHT *thdata;
     struct expbuf_t buf = {};
     size_t ret, siglen;
     unsigned char *sigret;
@@ -948,7 +963,7 @@ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve
 static void priv_ecdsa_finish(EC_KEY *key)
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
+    THDATA_IN_FLIGHT *thdata;
 
     ecdsa_get_privsep_data(key, &exdata, &thdata);
 
@@ -1014,7 +1029,7 @@ respond:
 
 int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf)
 {
-    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
+    THDATA_IN_FLIGHT *thdata = get_thread_data(nb);
     struct expbuf_t buf = {NULL};
     int ret = 1;
     size_t index, type;
@@ -1192,7 +1207,7 @@ Respond:
 
 int neverbleed_setuidgid(neverbleed_t *nb, const char *user, int change_socket_ownership)
 {
-    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
+    THDATA_IN_FLIGHT *thdata = get_thread_data(nb);
     struct expbuf_t buf = {NULL};
     size_t ret;
 
@@ -1292,7 +1307,7 @@ Redo:
 static int priv_rsa_finish(RSA *rsa)
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
+    THDATA_IN_FLIGHT *thdata;
 
     get_privsep_data(rsa, &exdata, &thdata);
 
