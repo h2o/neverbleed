@@ -579,23 +579,22 @@ static int async_pause(int fd)
 #ifdef NEVERBLEED_OPENSSL_HAVE_ASYNC
     ASYNC_JOB *job;
 
-    // dup the fd as the applicaiton may want to close it after polling
-    fd = dup(fd);
-    if (fd == -1) {
-        fprintf(stderr, "failed to dup(2) fd\n");
-        return -1;
-    }
-
     if ((job = ASYNC_get_current_job()) != NULL) {
+        // dup the fd as the applicaiton may want to close it after polling
+        fd = dup(fd);
+        if (fd == -1) {
+            fprintf(stderr, "failed to dup(2) fd\n");
+            return -1;
+        }
+
         ASYNC_WAIT_CTX *waitctx = ASYNC_get_wait_ctx(job);
 
         size_t numfds;
-        if (ASYNC_WAIT_CTX_get_all_fds(waitctx, NULL, &numfds) && numfds == 0) {
-            if(!ASYNC_WAIT_CTX_set_wait_fd(waitctx, "neverbleed", fd, NULL, NULL)) {
-                fprintf(stderr, "could not set async fd\n");
-                close(fd);
-                return -1;
-            }
+        assert(ASYNC_WAIT_CTX_get_all_fds(waitctx, NULL, &numfds) && numfds == 0);
+        if(!ASYNC_WAIT_CTX_set_wait_fd(waitctx, "neverbleed", fd, NULL, NULL)) {
+            fprintf(stderr, "could not set async fd\n");
+            close(fd);
+            return -1;
         }
         ASYNC_pause_job();
         if(!ASYNC_WAIT_CTX_clear_fd(waitctx, "neverbleed")) {
