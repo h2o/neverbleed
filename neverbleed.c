@@ -1301,6 +1301,58 @@ Respond:
     return 0;
 }
 
+int neverbleed_setaffinity(neverbleed_t *nb, cpu_set_t *cpuset)
+{
+    THDATA_IN_FLIGHT *thdata = get_thread_data(nb);
+    struct expbuf_t buf = {NULL};
+    size_t ret;
+
+    expbuf_push_str(&buf, "setaffinity");
+    expbuf_push_bytes(&buf, cpuset, sizeof(*cpuset));
+    if (expbuf_write(&buf, thdata->fd) != 0)
+        dief(errno != 0 ? "write error" : "connection closed by daemon");
+    expbuf_dispose(&buf);
+
+    if (expbuf_read(&buf, thdata->fd) != 0)
+        dief(errno != 0 ? "read error" : "connection closed by daemon");
+    if (expbuf_shift_num(&buf, &ret) != 0) {
+        errno = 0;
+        dief("failed to parse response");
+    }
+    expbuf_dispose(&buf);
+
+    return (int)ret;
+}
+
+static int setaffinity_stub(struct expbuf_t *buf)
+{
+    char *cpuset_bytes;
+    size_t cpuset_len;
+    cpu_set_t cpuset;
+    int ret = 1;
+    CPU_ZERO(&cpuset);
+
+    if ((cpuset_bytes = expbuf_shift_bytes(buf, &cpuset_len)) == NULL) {
+        errno = 0;
+        warnf("%s: failed to parse request", __FUNCTION__);
+        return -1;
+    }
+
+    assert(cpuset_len == sizeof(cpuset));
+    memcpy(&cpuset, cpuset_bytes, cpuset_len);
+
+    if(pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0) {
+        goto Respond;
+    }
+
+    ret = 0;
+
+Respond:
+    expbuf_dispose(buf);
+    expbuf_push_num(buf, ret);
+    return 0;
+}
+
 __attribute__((noreturn)) static void *daemon_close_notify_thread(void *_close_notify_fd)
 {
     int close_notify_fd = (int)((char *)_close_notify_fd - (char *)NULL);
@@ -1443,6 +1495,9 @@ static void *daemon_conn_thread(void *_sock_fd)
                 break;
         } else if (strcmp(cmd, "setuidgid") == 0) {
             if (setuidgid_stub(&buf) != 0)
+                break;
+        } else if (strcmp(cmd, "setaffinity") == 0) {
+            if (setaffinity_stub(&buf) != 0)
                 break;
         } else {
             warnf("unknown command:%s", cmd);
