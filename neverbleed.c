@@ -342,6 +342,31 @@ static int expbuf_write(struct expbuf_t *buf, int fd)
 
     return 0;
 }
+
+static void yield_on_data(int fd)
+{
+    fd_set rfds;
+    int ret;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+
+    while((ret = select(fd + 1, &rfds, NULL, NULL, NULL)) == -1 && (errno == EAGAIN || errno == EINTR))
+        ;
+    if (ret == -1) {
+        fprintf(stderr, "error in select(2): %d, %s\n", errno, strerror(errno));
+        dief("select(2)");
+    } else if (ret > 0) {
+        // yield when data is available
+        struct timespec tv = { .tv_nsec = 1 };
+        if (-1 == nanosleep(&tv, NULL)) {
+            dief("nanosleep");
+        }
+    } else {
+        // unreachable, no timeout configured
+        assert(0);
+    }
+}
+
 static int expbuf_read(struct expbuf_t *buf, int fd)
 {
     size_t sz;
@@ -1382,6 +1407,7 @@ static void *daemon_conn_thread(void *_sock_fd)
 
     while (1) {
         char *cmd;
+        yield_on_data(sock_fd);
         if (expbuf_read(&buf, sock_fd) != 0) {
             if (errno != 0)
                 warnf("read error");
