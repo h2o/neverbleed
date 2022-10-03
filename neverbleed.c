@@ -353,8 +353,7 @@ static void yield_on_data(int fd)
     while((ret = select(fd + 1, &rfds, NULL, NULL, NULL)) == -1 && (errno == EAGAIN || errno == EINTR))
         ;
     if (ret == -1) {
-        fprintf(stderr, "error in select(2): %d, %s\n", errno, strerror(errno));
-        dief("select(2)");
+        dief("select(2)\n");
     } else if (ret > 0) {
         // yield when data is available
         struct timespec tv = { .tv_nsec = 1 };
