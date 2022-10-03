@@ -363,7 +363,7 @@ static void yield_on_data(int fd)
         // yield when data is available
         struct timespec tv = { .tv_nsec = 1 };
         if (-1 == nanosleep(&tv, NULL)) {
-            dief("nanosleep");
+            warnf("nanosleep failed/interupted");
         }
     } else {
         // unreachable, no timeout configured
