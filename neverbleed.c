@@ -74,7 +74,7 @@
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
-#ifdef NEVERBLEED_OPENSSL_HAVE_ASYNC
+#if NEVERBLEED_OPENSSL_HAVE_ASYNC
 #include <openssl/async.h>
 #endif
 
@@ -601,7 +601,7 @@ static size_t daemon_set_rsa(RSA *rsa)
 // if OpenSSL async is not available, this function is a no-op
 static int async_pause(int fd)
 {
-#ifdef NEVERBLEED_OPENSSL_HAVE_ASYNC
+#if NEVERBLEED_OPENSSL_HAVE_ASYNC
     ASYNC_JOB *job;
 
     if ((job = ASYNC_get_current_job()) != NULL) {
@@ -1717,7 +1717,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "failed to initialize the OpenSSL engine");
         goto Fail;
     }
-#ifdef NEVERBLEED_OPENSSL_HAVE_ASYNC
+#if NEVERBLEED_OPENSSL_HAVE_ASYNC
     ERR_load_ASYNC_strings();
 #endif
     ENGINE_add(nb->engine);
