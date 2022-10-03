@@ -343,6 +343,11 @@ static int expbuf_write(struct expbuf_t *buf, int fd)
     return 0;
 }
 
+/**
+ * This function waits for the provided socket to become readable, then calls `nanosleep(1)` before returning.
+ * The intention behind sleep is to provide the application to complete its event loop before the neverbleed process starts
+ * spending CPU cycles on the time-consuming RSA operation.
+ */
 static void yield_on_data(int fd)
 {
     fd_set rfds;
