@@ -366,8 +366,7 @@ static void yield_on_data(int fd)
             warnf("nanosleep failed/interupted");
         }
     } else {
-        // unreachable, no timeout configured
-        assert(0);
+        dief("unreachable, no timeout configured");
     }
 }
 
@@ -603,7 +602,7 @@ static size_t daemon_set_rsa(RSA *rsa)
 
 // sets up file descriptor and calls OpenSSL's `ASYNC_pause_job`
 // if OpenSSL async is not available, this function is a no-op
-static int async_pause(int fd)
+static void async_pause(int fd)
 {
 #if NEVERBLEED_OPENSSL_HAVE_ASYNC
     ASYNC_JOB *job;
@@ -613,19 +612,13 @@ static int async_pause(int fd)
 
         size_t numfds;
         assert(ASYNC_WAIT_CTX_get_all_fds(waitctx, NULL, &numfds) && numfds == 0);
-        if (!ASYNC_WAIT_CTX_set_wait_fd(waitctx, "neverbleed", fd, NULL, NULL)) {
-            fprintf(stderr, "could not set async fd\n");
-            return -1;
-        }
+        if (!ASYNC_WAIT_CTX_set_wait_fd(waitctx, "neverbleed", fd, NULL, NULL))
+            dief("could not set async fd\n");
         ASYNC_pause_job();
-        if (!ASYNC_WAIT_CTX_clear_fd(waitctx, "neverbleed")) {
-            fprintf(stderr, "could not clear async fd\n");
-            return -1;
-        }
+        if (!ASYNC_WAIT_CTX_clear_fd(waitctx, "neverbleed"))
+            dief("could not clear async fd\n");
     }
 #endif
-
-    return 0;
 }
 
 
@@ -648,8 +641,7 @@ static int priv_encdec_proxy(const char *cmd, int flen, const unsigned char *fro
         dief(errno != 0 ? "write error" : "connection closed by daemon");
     expbuf_dispose(&buf);
 
-    if (async_pause(thdata->fd) != 0)
-        fprintf(stderr, "priv_encdec_proxy: could not async pause\n");
+    async_pause(thdata->fd);
     if (expbuf_read(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "read error" : "connection closed by daemon");
     if (expbuf_shift_num(&buf, &ret) != 0 || (to = expbuf_shift_bytes(&buf, &tolen)) == NULL) {
@@ -732,8 +724,7 @@ static int sign_proxy(int type, const unsigned char *m, unsigned int m_len, unsi
         dief(errno != 0 ? "write error" : "connection closed by daemon");
     expbuf_dispose(&buf);
 
-    if (async_pause(thdata->fd) != 0)
-        fprintf(stderr, "sign_proxy: could not async pause\n");
+    async_pause(thdata->fd);
     if (expbuf_read(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "read error" : "connection closed by daemon");
     if (expbuf_shift_num(&buf, &ret) != 0 || (sigret = expbuf_shift_bytes(&buf, &siglen)) == NULL) {
@@ -916,8 +907,7 @@ static int ecdsa_sign_proxy(int type, const unsigned char *m, int m_len, unsigne
         dief(errno != 0 ? "write error" : "connection closed by daemon");
     expbuf_dispose(&buf);
 
-    if (async_pause(thdata->fd) != 0)
-        fprintf(stderr, "ecdsa_sign_proxy: could not async pause\n");
+    async_pause(thdata->fd);
     if (expbuf_read(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "read error" : "connection closed by daemon");
     if (expbuf_shift_num(&buf, &ret) != 0 || (sigret = expbuf_shift_bytes(&buf, &siglen)) == NULL) {
@@ -997,8 +987,7 @@ static void priv_ecdsa_finish(EC_KEY *key)
         dief(errno != 0 ? "write error" : "connection closed by daemon");
     expbuf_dispose(&buf);
 
-    if (async_pause(thdata->fd) != 0)
-        fprintf(stderr, "priv_ecdsa_finish: could not async pause\n");
+    async_pause(thdata->fd);
     if (expbuf_read(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "read error" : "connection closed by daemon");
     if (expbuf_shift_num(&buf, &ret) != 0) {
@@ -1393,8 +1382,7 @@ static int priv_rsa_finish(RSA *rsa)
         dief(errno != 0 ? "write error" : "connection closed by daemon");
     expbuf_dispose(&buf);
 
-    if (async_pause(thdata->fd) != 0)
-        fprintf(stderr, "priv_rsa_finish: could not async pause\n");
+    async_pause(thdata->fd);
     if (expbuf_read(&buf, thdata->fd) != 0)
         dief(errno != 0 ? "read error" : "connection closed by daemon");
     if (expbuf_shift_num(&buf, &ret) != 0) {
