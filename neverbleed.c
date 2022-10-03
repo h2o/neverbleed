@@ -1292,7 +1292,8 @@ Respond:
     return 0;
 }
 
-int neverbleed_setaffinity(neverbleed_t *nb, cpu_set_t *cpuset)
+#if NEVERBLEED_HAS_PTHREAD_SETAFFINITY_NP
+int neverbleed_setaffinity(neverbleed_t *nb, NEVERBLEED_CPU_SET_T *cpuset)
 {
     THDATA_IN_FLIGHT *thdata = get_thread_data(nb);
     struct expbuf_t buf = {NULL};
@@ -1314,14 +1315,14 @@ int neverbleed_setaffinity(neverbleed_t *nb, cpu_set_t *cpuset)
 
     return (int)ret;
 }
+#endif
 
 static int setaffinity_stub(struct expbuf_t *buf)
 {
     char *cpuset_bytes;
     size_t cpuset_len;
-    cpu_set_t cpuset;
+    NEVERBLEED_CPU_SET_T cpuset;
     int ret = 1;
-    CPU_ZERO(&cpuset);
 
     if ((cpuset_bytes = expbuf_shift_bytes(buf, &cpuset_len)) == NULL) {
         errno = 0;
@@ -1329,10 +1330,16 @@ static int setaffinity_stub(struct expbuf_t *buf)
         return -1;
     }
 
-    assert(cpuset_len == sizeof(cpuset));
+    assert(cpuset_len == sizeof(NEVERBLEED_CPU_SET_T));
     memcpy(&cpuset, cpuset_bytes, cpuset_len);
 
-    if(pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0) {
+#ifdef __NetBSD__
+    ret = pthread_setaffinity_np(pthread_self(), cpuset_size(cpuset), cpuset);
+#else
+    ret = pthread_setaffinity_np(pthread_self(), sizeof(NEVERBLEED_CPU_SET_T), &cpuset);
+#endif
+    if (ret != 0) {
+        ret = 1;
         goto Respond;
     }
 
