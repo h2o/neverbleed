@@ -500,9 +500,7 @@ static struct {
         struct key_slots ecdsa_slots;
     } keys;
     neverbleed_t *nb;
-} daemon_vars = {
-    .keys.lock = PTHREAD_MUTEX_INITIALIZER,
-};
+} daemon_vars = {{PTHREAD_MUTEX_INITIALIZER}};
 
 static RSA *daemon_get_rsa(size_t key_index)
 {
