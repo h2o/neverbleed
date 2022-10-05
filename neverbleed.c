@@ -142,7 +142,7 @@ struct st_neverbleed_thread_data_t {
     int fd;
 };
 
-void thdata_reset_in_flight(struct st_neverbleed_thread_data_t **_thdata)
+static void thdata_reset_in_flight(struct st_neverbleed_thread_data_t **_thdata)
 {
     struct st_neverbleed_thread_data_t *thdata = *_thdata;
     assert(thdata->in_flight);
@@ -417,7 +417,7 @@ static void unlink_dir(const char *path)
     rmdir(path);
 }
 
-void dispose_thread_data(void *_thdata)
+static void dispose_thread_data(void *_thdata)
 {
     struct st_neverbleed_thread_data_t *thdata = _thdata;
     assert(thdata->fd >= 0);
@@ -426,7 +426,7 @@ void dispose_thread_data(void *_thdata)
     free(thdata);
 }
 
-struct st_neverbleed_thread_data_t *get_thread_data(neverbleed_t *nb)
+static struct st_neverbleed_thread_data_t *get_thread_data(neverbleed_t *nb)
 {
     struct st_neverbleed_thread_data_t *thdata;
     pid_t self_pid = getpid();
