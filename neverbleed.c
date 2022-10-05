@@ -149,7 +149,7 @@ static void thdata_reset_in_flight(struct st_neverbleed_thread_data_t **_thdata)
     thdata->in_flight = 0;
 }
 
-#define THDATA_IN_FLIGHT __attribute__ ((__cleanup__(thdata_reset_in_flight))) struct st_neverbleed_thread_data_t
+#define THDATA_IN_FLIGHT __attribute__((__cleanup__(thdata_reset_in_flight))) struct st_neverbleed_thread_data_t
 
 static void warnvf(const char *fmt, va_list args)
 {
@@ -356,7 +356,7 @@ static void yield_on_data(int fd)
     FD_ZERO(&rfds);
     FD_SET(fd, &rfds);
 
-    while((ret = select(fd + 1, &rfds, NULL, NULL, NULL)) == -1 && (errno == EAGAIN || errno == EINTR))
+    while ((ret = select(fd + 1, &rfds, NULL, NULL, NULL)) == -1 && (errno == EAGAIN || errno == EINTR))
         ;
     if (ret == -1) {
         dief("select(2)\n");
