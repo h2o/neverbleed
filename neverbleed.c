@@ -362,7 +362,7 @@ static void yield_on_data(int fd)
         dief("select(2)\n");
     } else if (ret > 0) {
         // yield when data is available
-        struct timespec tv = { .tv_nsec = 1 };
+        struct timespec tv = {.tv_nsec = 1};
         (void)nanosleep(&tv, NULL);
     } else {
         dief("unreachable, no timeout configured");
