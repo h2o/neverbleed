@@ -872,6 +872,126 @@ static void priv_ecdsa_finish(EC_KEY *key)
 
 #endif
 
+static EVP_PKEY *daemon_get_pkey(size_t key_index)
+{
+    EVP_PKEY *pkey = NULL;
+
+    pthread_mutex_lock(&daemon_vars.keys.lock);
+    if (key_index < daemon_vars.keys.num_slots && daemon_vars.keys.slots[key_index].pkey != NULL) {
+        pkey = daemon_vars.keys.slots[key_index].pkey;
+        EVP_PKEY_up_ref(pkey);
+    }
+    pthread_mutex_unlock(&daemon_vars.keys.lock);
+
+    return pkey;
+}
+
+static int digestsign_stub(neverbleed_iobuf_t *buf)
+{
+    size_t key_index, md_nid, signlen;
+    void *signdata;
+    EVP_PKEY *pkey;
+    const EVP_MD *md;
+
+    /* parse input */
+    if (iobuf_shift_num(buf, &key_index) != 0 || iobuf_shift_num(buf, &md_nid) != 0 ||
+        (signdata = iobuf_shift_bytes(buf, &signlen)) == NULL) {
+        errno = 0;
+        warnf("%s: failed to parse request", __FUNCTION__);
+        return -1;
+    }
+    if ((pkey = daemon_get_pkey(key_index)) == NULL) {
+        errno = 0;
+        warnf("%s: invalid key index:%zu", __FUNCTION__, key_index);
+        return -1;
+    }
+    if (md_nid != SIZE_MAX) {
+        if ((md = EVP_get_digestbynid((int)md_nid)) == NULL) {
+            errno = 0;
+            warnf("%s: invalid EVP_MD nid", __FUNCTION__);
+            return -1;
+        }
+    } else {
+        md = NULL;
+    }
+
+    /* generate signature */
+    EVP_MD_CTX *mdctx = NULL;
+    EVP_PKEY_CTX *pkey_ctx = NULL;
+    unsigned char digestbuf[4096];
+    size_t digestlen;
+
+    if ((mdctx = EVP_MD_CTX_create()) == NULL)
+        goto Softfail;
+    if (EVP_DigestSignInit(mdctx, &pkey_ctx, md, NULL, pkey) != 1)
+        goto Softfail;
+    if (EVP_PKEY_id(pkey) == EVP_PKEY_RSA) {
+        if (EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, RSA_PKCS1_PSS_PADDING) != 1 ||
+            EVP_PKEY_CTX_set_rsa_pss_saltlen(pkey_ctx, -1) != 1)
+            goto Softfail;
+        if (EVP_PKEY_CTX_set_rsa_mgf1_md(pkey_ctx, md) != 1)
+            goto Softfail;
+    }
+    if (EVP_DigestSign(mdctx, NULL, &digestlen, signdata, signlen) != 1)
+        goto Softfail;
+    if (sizeof(digestbuf) < digestlen) {
+        warnf("%s: digest unexpectedly long as %zu bytes", __FUNCTION__, digestlen);
+        goto Softfail;
+    }
+    if (EVP_DigestSign(mdctx, digestbuf, &digestlen, signdata, signlen) != 1)
+        goto Softfail;
+
+Respond: /* build response */
+    iobuf_dispose(buf);
+    iobuf_push_bytes(buf, digestbuf, digestlen);
+    if (mdctx != NULL)
+        EVP_MD_CTX_destroy(mdctx);
+    if (pkey != NULL)
+        EVP_PKEY_free(pkey);
+    return 0;
+
+Softfail:
+    digestlen = 0;
+    goto Respond;
+}
+
+void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const EVP_MD *md, const void *input, size_t len)
+{
+    struct st_neverbleed_rsa_exdata_t *exdata;
+    struct st_neverbleed_thread_data_t *thdata;
+
+    /* obtain reference */
+    switch (EVP_PKEY_base_id(pkey)) {
+    case EVP_PKEY_RSA:
+        get_privsep_data(EVP_PKEY_get0_RSA(pkey), &exdata, &thdata);
+        break;
+#ifdef NEVERBLEED_ECDSA
+    case EVP_PKEY_EC:
+        ecdsa_get_privsep_data(EVP_PKEY_get0_EC_KEY(pkey), &exdata, &thdata);
+        break;
+#endif
+    default:
+        dief("unexpected private key");
+        break;
+    }
+
+    *buf = (neverbleed_iobuf_t){NULL};
+    iobuf_push_str(buf, "digestsign");
+    iobuf_push_num(buf, exdata->key_index);
+    iobuf_push_num(buf, md != NULL ? (size_t)EVP_MD_nid(md) : SIZE_MAX);
+    iobuf_push_bytes(buf, input, len);
+}
+
+void neverbleed_finish_digestsign(neverbleed_iobuf_t *buf, void **digest, size_t *digest_len)
+{
+    const void *src = iobuf_shift_bytes(buf, digest_len);
+    if ((*digest = malloc(*digest_len)) == NULL)
+        dief("no memory");
+    memcpy(*digest, src, *digest_len);
+
+    iobuf_dispose(buf);
+}
+
 int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
@@ -1321,6 +1441,9 @@ static void *daemon_conn_thread(void *_sock_fd)
             if (ecdsa_sign_stub(&buf) != 0)
                 break;
 #endif
+        } else if (strcmp(cmd, "digestsign") == 0) {
+            if (digestsign_stub(&buf) != 0)
+                break;
         } else if (strcmp(cmd, "load_key") == 0) {
             if (load_key_stub(&buf) != 0)
                 break;
