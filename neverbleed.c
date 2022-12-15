@@ -932,13 +932,16 @@ static int digestsign_stub(neverbleed_iobuf_t *buf)
         if (EVP_PKEY_CTX_set_rsa_mgf1_md(pkey_ctx, md) != 1)
             goto Softfail;
     }
-    if (EVP_DigestSign(mdctx, NULL, &digestlen, signdata, signlen) != 1)
+    /* ED25519 keys can never be loaded, so use the Update -> Final call chain without worrying about backward compatibility */
+    if (EVP_DigestSignUpdate(mdctx, signdata, signlen) != 1)
+        goto Softfail;
+    if (EVP_DigestSignFinal(mdctx, NULL, &digestlen) != 1)
         goto Softfail;
     if (sizeof(digestbuf) < digestlen) {
         warnf("%s: digest unexpectedly long as %zu bytes", __FUNCTION__, digestlen);
         goto Softfail;
     }
-    if (EVP_DigestSign(mdctx, digestbuf, &digestlen, signdata, signlen) != 1)
+    if (EVP_DigestSignFinal(mdctx, digestbuf, &digestlen) != 1)
         goto Softfail;
 
 Respond: /* build response */
