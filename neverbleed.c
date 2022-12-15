@@ -507,20 +507,26 @@ static RSA *daemon_get_rsa(size_t key_index)
 
 size_t allocate_slot(void)
 {
-    size_t index;
-
-    if ((index = daemon_vars.keys.first_empty) != SIZE_MAX) {
-        daemon_vars.keys.first_empty = daemon_vars.keys.slots[index].next_empty;
-    } else {
-        if ((daemon_vars.keys.slots = realloc(daemon_vars.keys.slots,
-                                              sizeof(daemon_vars.keys.slots[0]) * (daemon_vars.keys.num_slots + 1))) == NULL)
+    /* expand if all slots are in use */
+    if (daemon_vars.keys.first_empty == SIZE_MAX) {
+        size_t new_capacity = (daemon_vars.keys.num_slots < 4 ? 4 : daemon_vars.keys.num_slots) * 2;
+        if ((daemon_vars.keys.slots = realloc(daemon_vars.keys.slots, sizeof(daemon_vars.keys.slots[0]) * new_capacity)) == NULL)
             dief("no memory");
-        index = daemon_vars.keys.num_slots++;
+        daemon_vars.keys.first_empty = daemon_vars.keys.num_slots;
+        for (size_t i = daemon_vars.keys.num_slots; i < new_capacity - 1; ++i)
+            daemon_vars.keys.slots[i].next_empty = i + 1;
+        daemon_vars.keys.slots[new_capacity - 1].next_empty = SIZE_MAX;
+        daemon_vars.keys.num_slots = new_capacity;
     }
 
-    daemon_vars.keys.slots[index].next_empty = SIZE_MAX - 1; /* bogus value to help figure out what happened upon crash */
+    /* detach the first empty slot from the empty list */
+    size_t slot_index = daemon_vars.keys.first_empty;
+    daemon_vars.keys.first_empty = daemon_vars.keys.slots[slot_index].next_empty;
 
-    return index;
+    /* set bogus value in the allocated slot to help figure out what happened upon crash */
+    daemon_vars.keys.slots[slot_index].next_empty = SIZE_MAX - 1;
+
+    return slot_index;
 }
 
 static size_t daemon_set_pkey(EVP_PKEY *pkey)
