@@ -69,6 +69,15 @@ int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char 
  */
 int neverbleed_setuidgid(neverbleed_t *nb, const char *user, int change_socket_ownership);
 
+/**
+ * builds a digestsign request
+ */
+void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const EVP_MD *md, const void *input, size_t len);
+/**
+ * parses a digestsign response
+ */
+void neverbleed_finish_digestsign(neverbleed_iobuf_t *buf, void **digest, size_t *digest_len);
+
 #if NEVERBLEED_HAS_PTHREAD_SETAFFINITY_NP
 /**
  * set the cpu affinity for the neverbleed thread (returns 0 if successful)
