@@ -45,6 +45,7 @@
 #include <sys/ptrace.h>
 #elif defined(__FreeBSD__)
 #include <sys/procctl.h>
+#include <pthread_np.h>
 #elif defined(__sun)
 #include <priv.h>
 #endif
@@ -1661,8 +1662,10 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
         prctl(PR_SET_PDEATHSIG, SIGTERM);
 #elif defined(__FreeBSD__)
+        int sigterm = SIGTERM;
         int dumpable = PROC_TRACE_CTL_DISABLE;
         procctl(P_PID, 0, PROC_TRACE_CTL, &dumpable);
+        procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sigterm);
 #elif defined(__sun)
         setpflags(__PROC_PROTECT, 1);
 #elif defined(__APPLE__)
