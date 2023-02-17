@@ -1011,6 +1011,67 @@ void neverbleed_finish_digestsign(neverbleed_iobuf_t *buf, void **digest, size_t
     iobuf_dispose(buf);
 }
 
+static int decrypt_stub(neverbleed_iobuf_t *buf)
+{
+    size_t key_index, srclen;
+    void *src;
+    EVP_PKEY *pkey;
+    RSA *rsa;
+    uint8_t decryptbuf[1024];
+    size_t decryptlen;
+
+    /* parse input */
+    if (iobuf_shift_num(buf, &key_index) != 0 || (src = iobuf_shift_bytes(buf, &srclen)) == NULL) {
+        errno = 0;
+        warnf("%s: failed to parse request", __FUNCTION__);
+        return -1;
+    }
+    if ((pkey = daemon_get_pkey(key_index)) == NULL) {
+        errno = 0;
+        warnf("%s: invalid key index:%zu", __FUNCTION__, key_index);
+        return -1;
+    }
+
+    rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
+    assert(rsa != NULL);
+
+    if (!RSA_decrypt(rsa, &decryptlen, decryptbuf, sizeof(buf), src, srclen, RSA_NO_PADDING)) {
+        errno = 0;
+        warnf("RSA decryption error");
+        decryptlen = 0; /* soft failure */
+    }
+
+Respond:
+    iobuf_dispose(buf);
+    iobuf_push_bytes(buf, decryptbuf, decryptlen);
+    RSA_free(rsa);
+    EVP_PKEY_free(pkey);
+    return 0;
+}
+
+void neverbleed_start_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const void *input, size_t len)
+{
+    struct st_neverbleed_rsa_exdata_t *exdata;
+    struct st_neverbleed_thread_data_t *thdata;
+
+    {
+        RSA *rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
+        assert(rsa != NULL);
+        get_privsep_data(rsa, &exdata, &thdata);
+        RSA_free(rsa);
+    }
+
+    *buf = (neverbleed_iobuf_t){NULL};
+    iobuf_push_str(buf, "decrypt");
+    iobuf_push_num(buf, exdata->key_index);
+    iobuf_push_bytes(buf, input, len);
+}
+
+void neverbleed_finish_decrypt(neverbleed_iobuf_t *buf, void **digest, size_t *digest_len)
+{
+    neverbleed_finish_digestsign(buf, digest, digest_len);
+}
+
 int neverbleed_load_private_key_file(neverbleed_t *nb, SSL_CTX *ctx, const char *fn, char *errbuf)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
@@ -1463,6 +1524,9 @@ static void *daemon_conn_thread(void *_sock_fd)
 #endif
             if (strcmp(cmd, "digestsign") == 0) {
             if (digestsign_stub(&buf) != 0)
+                break;
+        } else if (strcmp(cmd, "decrypt") == 0) {
+            if (decrypt_stub(&buf) != 0)
                 break;
         } else if (strcmp(cmd, "load_key") == 0) {
             if (load_key_stub(&buf) != 0)
