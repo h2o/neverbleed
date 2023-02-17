@@ -1135,7 +1135,7 @@ static int load_key_stub(neverbleed_iobuf_t *buf)
             dief("failed to serialize EC public key");
         break;
 #else
-        snprintf(errbuf, sizeof(errbuf), "ECDSA support requires OpenSSL >= 1.1.0 or LibreSSL >= 2.9.1");
+        snprintf(errbuf, sizeof(errbuf), "ECDSA support requires OpenSSL >= 1.1.0, LibreSSL >= 2.9.1, or BoringSSL");
         goto Respond;
 #endif
     }
