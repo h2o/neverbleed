@@ -1175,7 +1175,7 @@ Respond:
         OPENSSL_free(nstr);
 #ifdef NEVERBLEED_ECDSA
     if (ec_pubkeybytes != NULL)
-        OPENSSL_free(ec_pubkeybytes);
+        free(ec_pubkeybytes);
     if (bn_ctx != NULL)
         BN_CTX_free(bn_ctx);
 #endif
