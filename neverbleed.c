@@ -1672,8 +1672,6 @@ static int wait_for_read(struct conn_ctx *conn_ctx)
         }
     } while (!has_read);
 
-    return 0;
-
 #else
 
     fd_set rfds;
@@ -1683,19 +1681,16 @@ static int wait_for_read(struct conn_ctx *conn_ctx)
 
     while ((ret = select(fd + 1, &rfds, NULL, NULL, NULL)) == -1 && (errno == EAGAIN || errno == EINTR))
         ;
-    if (ret == -1) {
+    if (ret == -1)
         dief("select(2)\n");
-    } else if (ret > 0) {
-        // yield when data is available
-        struct timespec tv = {.tv_nsec = 1};
-        (void)nanosleep(&tv, NULL);
-    } else {
-        dief("unreachable, no timeout configured");
-    }
-
-    return 0;
 
 #endif
+
+    // yield when data is available
+    struct timespec tv = {.tv_nsec = 1};
+    (void)nanosleep(&tv, NULL);
+
+    return 0;
 }
 
 static void *daemon_conn_thread(void *_sock_fd)
