@@ -499,7 +499,6 @@ static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t *
 }
 
 struct conn_ctx {
-    size_t refcnt;
     int sockfd;
 #ifdef __linux
     int epollfd;
@@ -507,8 +506,6 @@ struct conn_ctx {
     struct {
         neverbleed_iobuf_t *first, **next;
     } responses;
-    unsigned write_errored : 1;
-    pthread_mutex_t mutex;
 };
 
 struct engine_request {
@@ -540,61 +537,27 @@ static struct {
     neverbleed_t *nb;
 } daemon_vars = {.keys = {.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX}};
 
-static void acquire_conn_ctx(struct conn_ctx *conn_ctx)
+static int send_responses(struct conn_ctx *conn_ctx, int cleanup)
 {
-    pthread_mutex_lock(&conn_ctx->mutex);
-    ++conn_ctx->refcnt;
-    pthread_mutex_unlock(&conn_ctx->mutex);
-}
-
-static void free_conn_ctx(struct conn_ctx *conn_ctx)
-{
-    int dispose = 0;
-
-    pthread_mutex_lock(&conn_ctx->mutex);
-    if (--conn_ctx->refcnt == 0)
-        dispose = 1;
-    pthread_mutex_unlock(&conn_ctx->mutex);
-
-    if (!dispose)
-        return;
-
-    assert(conn_ctx->responses.first == NULL);
-
-    close(conn_ctx->sockfd);
-#ifdef __linux
-    close(conn_ctx->epollfd);
-#endif
-    free(conn_ctx);
-}
-
-static void submit_response(struct conn_ctx *conn_ctx, neverbleed_iobuf_t *buf, int run_async)
-{
-    pthread_mutex_lock(&conn_ctx->mutex);
-
-    if (!run_async) {
-        *conn_ctx->responses.next = buf;
-        conn_ctx->responses.next = &buf->next;
-    } else {
-        buf->processing = 0;
-    }
+    neverbleed_iobuf_t *buf;
+    int result = 0;
 
     /* Send all buffers that have data being filled. The lock is held until everything is being done, as this function can be called
      * from multiple threads simultaneously. */
     while ((buf = conn_ctx->responses.first) != NULL && !buf->processing) {
         if ((conn_ctx->responses.first = buf->next) == NULL)
             conn_ctx->responses.next = &conn_ctx->responses.first;
-        if (!conn_ctx->write_errored) {
-            if (iobuf_write(buf, conn_ctx->sockfd) != 0) {
-                warnf(errno != 0 ? "write error" : "connection closed by client");
-                conn_ctx->write_errored = 1;
-            }
+        if (!cleanup && iobuf_write(buf, conn_ctx->sockfd) != 0) {
+            warnf(errno != 0 ? "write error" : "connection closed by client");
+            result = -1;
         }
         iobuf_dispose(buf);
         free(buf);
+        if (result != 0)
+            break;
     }
 
-    pthread_mutex_unlock(&conn_ctx->mutex);
+    return result;
 }
 
 static RSA *daemon_get_rsa(size_t key_index)
@@ -1564,7 +1527,6 @@ static void free_req(struct engine_request *req)
 {
     if (req->async.ctx != NULL)
         ASYNC_WAIT_CTX_free(req->async.ctx);
-    free_conn_ctx(req->conn_ctx);
     free(req);
 }
 
@@ -1592,7 +1554,6 @@ static int offload_stub(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *b
         .conn_ctx = conn_ctx};
     if (req->async.ctx == NULL)
         dief("failed to create ASYNC_WAIT_CTX\n");
-    acquire_conn_ctx(conn_ctx);
 
     int ret;
     switch (ASYNC_start_job(&req->async.job, req->async.ctx, &ret, offload_jobfunc, &req, sizeof(req))) {
@@ -1637,7 +1598,7 @@ static int offload_run(struct engine_request *req)
     }
 
     /* job done */
-    submit_response(req->conn_ctx, req->buf, 1);
+    req->buf->processing = 0;
     free_req(req);
 
     return ret;
@@ -1648,7 +1609,7 @@ static int offload_run(struct engine_request *req)
  * The intention behind sleep is to provide the application to complete its event loop before the neverbleed process starts
  * spending CPU cycles on the time-consuming RSA operation.
  */
-static int wait_for_read(struct conn_ctx *conn_ctx)
+static int wait_for_data(struct conn_ctx *conn_ctx, int cleanup)
 {
 #ifdef __linux
 
@@ -1667,6 +1628,8 @@ static int wait_for_read(struct conn_ctx *conn_ctx)
                 struct engine_request *req = events[i].data.ptr;
                 int ret;
                 if ((ret = offload_run(req)) != 0)
+                    return ret;
+                if ((ret = send_responses(conn_ctx, 0)) != 0)
                     return ret;
             }
         }
@@ -1695,27 +1658,22 @@ static int wait_for_read(struct conn_ctx *conn_ctx)
 
 static void *daemon_conn_thread(void *_sock_fd)
 {
-    struct conn_ctx *conn_ctx = malloc(sizeof(*conn_ctx));
-    if (conn_ctx == NULL)
-        dief("no memory");
-    *conn_ctx = (struct conn_ctx){.refcnt = 1,
-                                  .sockfd = (int)((char *)_sock_fd - (char *)NULL),
-                                  .responses.next = &conn_ctx->responses.first,
-                                  .mutex = PTHREAD_MUTEX_INITIALIZER};
+    struct conn_ctx conn_ctx = {.sockfd = (int)((char *)_sock_fd - (char *)NULL),
+                                .responses.next = &conn_ctx.responses.first};
 
 #ifdef __linux
-    if ((conn_ctx->epollfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
+    if ((conn_ctx.epollfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
         dief("epoll_create1 failed:%d\n", errno);
     {
         struct epoll_event ev = {.events = EPOLLIN};
-        if (do_epoll_ctl(conn_ctx->epollfd, EPOLL_CTL_ADD, conn_ctx->sockfd, &ev) != 0)
+        if (do_epoll_ctl(conn_ctx.epollfd, EPOLL_CTL_ADD, conn_ctx.sockfd, &ev) != 0)
             dief("epoll_ctl failed:%d\n", errno);
     }
 #endif
 
     { /* authenticate */
         unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
-        if (read_nbytes(conn_ctx->sockfd, &auth_token, sizeof(auth_token)) != 0) {
+        if (read_nbytes(conn_ctx.sockfd, &auth_token, sizeof(auth_token)) != 0) {
             warnf("failed to receive authencication token from client");
             goto Exit;
         }
@@ -1726,14 +1684,14 @@ static void *daemon_conn_thread(void *_sock_fd)
     }
 
     while (1) {
-        if (wait_for_read(conn_ctx) != 0)
+        if (wait_for_data(&conn_ctx, 0) != 0)
             break;
         neverbleed_iobuf_t *buf = malloc(sizeof(*buf));
         if (buf == NULL)
             dief("no memory");
         *buf = (neverbleed_iobuf_t){};
         char *cmd;
-        if (iobuf_read(buf, conn_ctx->sockfd) != 0) {
+        if (iobuf_read(buf, conn_ctx.sockfd) != 0) {
             if (errno != 0)
                 warnf("read error");
             break;
@@ -1745,13 +1703,13 @@ static void *daemon_conn_thread(void *_sock_fd)
         }
 #if !defined(OPENSSL_IS_BORINGSSL)
         if (strcmp(cmd, "priv_enc") == 0) {
-            if (offload_stub(priv_enc_stub, buf, conn_ctx) != 0)
+            if (offload_stub(priv_enc_stub, buf, &conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "priv_dec") == 0) {
-            if (offload_stub(priv_dec_stub, buf, conn_ctx) != 0)
+            if (offload_stub(priv_dec_stub, buf, &conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "sign") == 0) {
-            if (offload_stub(sign_stub, buf, conn_ctx) != 0)
+            if (offload_stub(sign_stub, buf, &conn_ctx) != 0)
                 break;
 #ifdef NEVERBLEED_ECDSA
         } else if (strcmp(cmd, "ecdsa_sign") == 0) {
@@ -1761,10 +1719,10 @@ static void *daemon_conn_thread(void *_sock_fd)
         } else
 #endif
             if (strcmp(cmd, "digestsign") == 0) {
-            if (offload_stub(digestsign_stub, buf, conn_ctx) != 0)
+            if (offload_stub(digestsign_stub, buf, &conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "decrypt") == 0) {
-            if (offload_stub(decrypt_stub, buf, conn_ctx) != 0)
+            if (offload_stub(decrypt_stub, buf, &conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "load_key") == 0) {
             if (load_key_stub(buf) != 0)
@@ -1784,11 +1742,23 @@ static void *daemon_conn_thread(void *_sock_fd)
             warnf("unknown command:%s", cmd);
             break;
         }
-        submit_response(conn_ctx, buf, 0);
+        /* add response to chain */
+        *conn_ctx.responses.next = buf;
+        conn_ctx.responses.next = &buf->next;
+        /* send responses if possible */
+        if (send_responses(&conn_ctx, 0) != 0)
+            break;
     }
 
 Exit:
-    free_conn_ctx(conn_ctx);
+    /* run the loop while async ops are running */
+    while (conn_ctx.responses.first != NULL)
+        wait_for_data(&conn_ctx, 1);
+
+    close(conn_ctx.sockfd);
+#ifdef __linux
+    close(conn_ctx.epollfd);
+#endif
 
     return NULL;
 }
