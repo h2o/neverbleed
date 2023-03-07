@@ -1274,7 +1274,7 @@ static int load_key_stub(neverbleed_iobuf_t *buf)
     }
 
 #ifdef OPENSSL_IS_BORINGSSL
-    if (neverbleed_qat.jobs != 0 && bssl_private_key_method_update(pkey) != 0)
+    if (neverbleed_qat && bssl_private_key_method_update(pkey) != 0)
         dief("failed to set callbacks");
 #endif
 
@@ -1577,7 +1577,7 @@ static int offload_jobfunc(void *_req)
 static int offload_stub(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *buf, struct conn_ctx *conn_ctx)
 {
     /* if engine is not used, run the stub synchronously */
-    if (neverbleed_qat.jobs == 0)
+    if (!neverbleed_qat)
         return stub(buf);
 
     buf->processing = 1;
@@ -1849,7 +1849,7 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
     pthread_attr_init(&thattr);
     pthread_attr_setdetachstate(&thattr, 1);
 
-    if (neverbleed_qat.jobs != 0) {
+    if (neverbleed_qat) {
 #ifdef OPENSSL_IS_BORINGSSL
 #ifdef NEVERBLEED_BORINGSSL_USE_QAT
         ENGINE_load_qat();
@@ -2053,4 +2053,4 @@ Fail:
 
 void (*neverbleed_post_fork_cb)(void) = NULL;
 void (*neverbleed_transaction_cb)(neverbleed_iobuf_t *) = NULL;
-struct neverbleed_qat neverbleed_qat = {.jobs = 100};
+int neverbleed_qat = 0;

@@ -114,11 +114,9 @@ void neverbleed_transaction_read(neverbleed_t *nb, neverbleed_iobuf_t *buf);
 void neverbleed_transaction_write(neverbleed_t *nb, neverbleed_iobuf_t *buf);
 
 /**
- * if set to jobs is set to a non-zero value, RSA operations are offloaded to QAT
+ * if set to a non-zero value, RSA operations are offloaded to QAT
  */
-extern struct neverbleed_qat {
-    unsigned jobs;
-} neverbleed_qat;
+extern int neverbleed_qat;
 
 /* inline function definitions */
 
