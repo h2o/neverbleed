@@ -74,6 +74,13 @@
 
 #if defined(OPENSSL_IS_BORINGSSL) && defined(NEVERBLEED_BORINGSSL_USE_QAT)
 #include "qat_bssl.h"
+
+/* the mapping seems to be missing */
+#ifndef ASYNC_WAIT_CTX_get_all_fds
+extern int bssl_async_wait_ctx_get_all_fds(ASYNC_WAIT_CTX *ctx, OSSL_ASYNC_FD *fd, size_t *numfds);
+#define ASYNC_WAIT_CTX_get_all_fds bssl_async_wait_ctx_get_all_fds
+#endif
+
 #endif
 
 #if OPENSSL_VERSION_NUMBER < 0x1010000fL \
@@ -193,6 +200,7 @@ static void set_cloexec(int fd)
 }
 
 #ifdef __linux
+
 static int do_epoll_ctl(int epollfd, int op, int fd, struct epoll_event *event)
 {
     int ret;
@@ -200,6 +208,7 @@ static int do_epoll_ctl(int epollfd, int op, int fd, struct epoll_event *event)
         ;
     return ret;
 }
+
 #endif
 
 static int read_nbytes(int fd, void *p, size_t sz)
@@ -498,7 +507,7 @@ static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t *
     *thdata = get_thread_data((*exdata)->nb);
 }
 
-struct conn_ctx {
+static __thread struct {
     int sockfd;
 #ifdef __linux
     int epollfd;
@@ -506,18 +515,32 @@ struct conn_ctx {
     struct {
         neverbleed_iobuf_t *first, **next;
     } responses;
-};
+} conn_ctx;
 
 struct engine_request {
-    int (*stub)(neverbleed_iobuf_t *);
     neverbleed_iobuf_t *buf;
+    int async_fd;
+#ifdef OPENSSL_IS_BORINGSSL
+    enum {
+        ENGINE_REQUEST_TYPE_DIGESTSIGN,
+        ENGINE_REQUEST_TYPE_DECRYPT,
+    } type;
+    union {
+        struct {
+            RSA *rsa;
+            uint8_t padded[512];
+            size_t padded_len;
+            uint8_t signature[512];
+        } digestsign;
+    } data;
+    async_ctx *async_ctx;
+#else
+    int (*stub)(neverbleed_iobuf_t *);
     struct {
         ASYNC_WAIT_CTX *ctx;
         ASYNC_JOB *job;
-        int fd;
     } async;
-    struct conn_ctx *conn_ctx;
-    struct engine_request *next;
+#endif
 };
 
 static struct {
@@ -537,17 +560,35 @@ static struct {
     neverbleed_t *nb;
 } daemon_vars = {.keys = {.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX}};
 
-static int send_responses(struct conn_ctx *conn_ctx, int cleanup)
+static void register_wait_fd(struct engine_request *req)
+{
+#ifdef OPENSSL_IS_BORINGSSL
+    ASYNC_WAIT_CTX *ctx = req->async_ctx->currjob->waitctx;
+#else
+    ASYNC_WAIT_CTX *ctx = req->async.ctx;
+#endif
+    size_t numfds;
+
+    if (!ASYNC_WAIT_CTX_get_all_fds(ctx, NULL, &numfds) || numfds != 1)
+        dief("unexpected number of fds (%zu) requested in async mode\n", numfds);
+    if (!ASYNC_WAIT_CTX_get_all_fds(ctx, &req->async_fd, &numfds))
+        dief("ASYNC_WAIT_CTX_get_all_fds failed\n");
+    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = req};
+    if (do_epoll_ctl(conn_ctx.epollfd, EPOLL_CTL_ADD, req->async_fd, &ev) != 0)
+        dief("epoll_ctl failed:%d\n", errno);
+}
+
+static int send_responses(int cleanup)
 {
     neverbleed_iobuf_t *buf;
     int result = 0;
 
     /* Send all buffers that have data being filled. The lock is held until everything is being done, as this function can be called
      * from multiple threads simultaneously. */
-    while ((buf = conn_ctx->responses.first) != NULL && !buf->processing) {
-        if ((conn_ctx->responses.first = buf->next) == NULL)
-            conn_ctx->responses.next = &conn_ctx->responses.first;
-        if (!cleanup && iobuf_write(buf, conn_ctx->sockfd) != 0) {
+    while ((buf = conn_ctx.responses.first) != NULL && !buf->processing) {
+        if ((conn_ctx.responses.first = buf->next) == NULL)
+            conn_ctx.responses.next = &conn_ctx.responses.first;
+        if (!cleanup && iobuf_write(buf, conn_ctx.sockfd) != 0) {
             warnf(errno != 0 ? "write error" : "connection closed by client");
             result = -1;
         }
@@ -962,6 +1003,64 @@ static EVP_PKEY *daemon_get_pkey(size_t key_index)
     return pkey;
 }
 
+#ifdef OPENSSL_IS_BORINGSSL
+
+static void bssl_offload_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const EVP_MD *md, const void *signdata,
+                                    size_t signlen)
+{
+    uint8_t digest[EVP_MAX_MD_SIZE];
+
+    { /* generate digest of signdata */
+        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+        unsigned digestlen;
+        if (mdctx == NULL)
+            dief("no memory\n");
+        if (!EVP_DigestInit_ex(mdctx, md, NULL) ||
+            !EVP_DigestUpdate(mdctx, signdata, signlen) ||
+            !EVP_DigestFinal_ex(mdctx, digest, &digestlen))
+            dief("digest calculation failed\n");
+        EVP_MD_CTX_free(mdctx);
+    }
+
+    /* instantiate request context */
+    RSA *_rsa = EVP_PKEY_get1_RSA(pkey);
+    struct engine_request *req = malloc(sizeof(*req));
+    if (req == NULL)
+        dief("no memory\n");
+    *req = (struct engine_request){.buf = buf,
+                                   .async_fd = -1,
+                                   .async_ctx = bssl_qat_async_start_job(),
+                                   .type = ENGINE_REQUEST_TYPE_DIGESTSIGN,
+                                   .data.digestsign = {.rsa = _rsa, .padded_len = RSA_size(_rsa)}};
+    if (req->async_ctx == NULL)
+        dief("failed to initialize async job\n");
+    if (sizeof(req->data.digestsign.padded) < req->data.digestsign.padded_len)
+        dief("RSA key too large:%zu\n", req->data.digestsign.padded_len);
+
+    /* generate padded octets to be signed */
+    if (!RSA_padding_add_PKCS1_PSS_mgf1(req->data.digestsign.rsa, req->data.digestsign.padded, digest, md, md, -1))
+        dief("RSA_paddding_add_PKCS1_PSS_mgf1 failed\n");
+
+    OPENSSL_cleanse(digest, sizeof(digest));
+
+    /* dispatch RSA calculation */
+    RSA_METHOD *meth = bssl_engine_get_rsa_method();
+    if (meth == NULL)
+        dief("failed to obtain QAT RSA method table\n");
+
+    size_t siglen;
+    if (!meth->sign_raw(req->data.digestsign.rsa, &siglen, req->data.digestsign.signature, req->data.digestsign.padded_len,
+                        req->data.digestsign.padded, req->data.digestsign.padded_len, RSA_NO_PADDING))
+        dief("sign_raw failure\n");
+    if (siglen != 0)
+        dief("sign_raw completed synchronously unexpectedly");
+
+    buf->processing = 1;
+    register_wait_fd(req);
+}
+
+#endif
+
 static int digestsign_stub(neverbleed_iobuf_t *buf)
 {
     size_t key_index, md_nid, signlen;
@@ -990,6 +1089,13 @@ static int digestsign_stub(neverbleed_iobuf_t *buf)
     } else {
         md = NULL;
     }
+
+#ifdef OPENSSL_IS_BORINGSSL
+    if (neverbleed_qat && EVP_PKEY_id(pkey) == EVP_PKEY_RSA) {
+        bssl_offload_digestsign(buf, pkey, md, signdata, signlen);
+        return 0;
+    }
+#endif
 
     /* generate signature */
     EVP_MD_CTX *mdctx = NULL;
@@ -1527,10 +1633,55 @@ respond:
 
 static void free_req(struct engine_request *req)
 {
-    if (req->async.ctx != NULL)
-        ASYNC_WAIT_CTX_free(req->async.ctx);
+#ifdef OPENSSL_IS_BORINGSSL
+    bssl_qat_async_finish_job(req->async_ctx);
+#else
+    ASYNC_WAIT_CTX_free(req->async.ctx);
+#endif
+    OPENSSL_cleanse(req, sizeof(*req));
     free(req);
 }
+
+#ifdef OPENSSL_IS_BORINGSSL
+
+#define offload_start(stub, buf) ((stub)(buf))
+
+static int offload_resume(struct engine_request *req)
+{
+    if (do_epoll_ctl(conn_ctx.epollfd, EPOLL_CTL_DEL, req->async_fd, NULL) != 0)
+        dief("epoll_ctl failed:%d\n", errno);
+
+    switch (req->type) {
+
+    case ENGINE_REQUEST_TYPE_DIGESTSIGN: {
+        size_t siglen;
+        /* get signture */
+        if (bssl_qat_async_ctx_copy_result(req->async_ctx, req->data.digestsign.signature, &siglen,
+                                           sizeof(req->data.digestsign.signature)) != 0)
+            dief("failed to obtain offload result\n");
+        if (siglen > sizeof(req->data.digestsign.signature))
+            dief("RSA signature unexpectedly large\n");
+        /* save the result */
+        iobuf_dispose(req->buf);
+        iobuf_push_bytes(req->buf, req->data.digestsign.signature, siglen);
+        /* cleanup */
+        RSA_free(req->data.digestsign.rsa);
+        req->data.digestsign.rsa = NULL;
+    } break;
+
+    default:
+        dief("FIXME");
+        break;
+
+    }
+
+    req->buf->processing = 0;
+    free_req(req);
+
+    return 0;
+}
+
+#else
 
 static int offload_jobfunc(void *_req)
 {
@@ -1538,7 +1689,7 @@ static int offload_jobfunc(void *_req)
     return req->stub(req->buf);
 }
 
-static int offload_start(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *buf, struct conn_ctx *conn_ctx)
+static int offload_start(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *buf)
 {
     /* if engine is not used, run the stub synchronously */
     if (!neverbleed_qat)
@@ -1549,27 +1700,16 @@ static int offload_start(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *
     struct engine_request *req = malloc(sizeof(*req));
     if (req == NULL)
         dief("no memory");
-    *req = (struct engine_request){
-        .stub = stub,
-        .buf = buf,
-        .async = {.ctx = ASYNC_WAIT_CTX_new(), .fd = -1},
-        .conn_ctx = conn_ctx};
-    if (req->async.ctx == NULL)
+    *req = (struct engine_request){.buf = buf, .async_fd = -1, .stub = stub};
+
+    if ((req->async.ctx =  ASYNC_WAIT_CTX_new()) == NULL)
         dief("failed to create ASYNC_WAIT_CTX\n");
 
     int ret;
     switch (ASYNC_start_job(&req->async.job, req->async.ctx, &ret, offload_jobfunc, &req, sizeof(req))) {
-    case ASYNC_PAUSE: { /* operation running async; register fd and bail out */
-        size_t numfds;
-        if (!ASYNC_WAIT_CTX_get_all_fds(req->async.ctx, NULL, &numfds) || numfds != 1)
-            dief("unexpected number of fds (%zu) requested in async mode\n", numfds);
-        if (!ASYNC_WAIT_CTX_get_all_fds(req->async.ctx, &req->async.fd, &numfds))
-            dief("ASYNC_WAIT_CTX_get_all_fds failed\n");
-        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = req};
-        if (do_epoll_ctl(req->conn_ctx->epollfd, EPOLL_CTL_ADD, req->async.fd, &ev) != 0)
-            dief("epoll_ctl failed:%d\n", errno);
+    case ASYNC_PAUSE: /* operation running async; register fd and bail out */
+        register_wait_fd(req);
         return 0;
-    } break;
     case ASYNC_FINISH: /* completed synchronously */
         break;
     default:
@@ -1591,7 +1731,7 @@ static int offload_resume(struct engine_request *req)
         /* assume that wait fd is unchanged */
         return 0;
     case ASYNC_FINISH:
-        if (do_epoll_ctl(req->conn_ctx->epollfd, EPOLL_CTL_DEL, req->async.fd, NULL) != 0)
+        if (do_epoll_ctl(conn_ctx.epollfd, EPOLL_CTL_DEL, req->async_fd, NULL) != 0)
             dief("epoll_ctl failed:%d\n", errno);
         break;
     default:
@@ -1606,12 +1746,14 @@ static int offload_resume(struct engine_request *req)
     return ret;
 }
 
+#endif
+
 /**
  * This function waits for the provided socket to become readable, then calls `nanosleep(1)` before returning.
  * The intention behind sleep is to provide the application to complete its event loop before the neverbleed process starts
  * spending CPU cycles on the time-consuming RSA operation.
  */
-static int wait_for_data(struct conn_ctx *conn_ctx, int cleanup)
+static int wait_for_data(int cleanup)
 {
 #ifdef __linux
 
@@ -1619,10 +1761,11 @@ static int wait_for_data(struct conn_ctx *conn_ctx, int cleanup)
     int has_read = 0, num_events;
 
     do {
-        while ((num_events = epoll_wait(conn_ctx->epollfd, events, sizeof(events) / sizeof(events[0]), -1)) == -1) {
-            if (errno != EINTR)
-                warnf("epoll_wait failed:%d\n", errno);
-        }
+        while ((num_events = epoll_wait(conn_ctx.epollfd, events, sizeof(events) / sizeof(events[0]), -1)) == -1 &&
+               (errno == EAGAIN || errno == EINTR))
+            ;
+        if (num_events == -1)
+            dief("epoll_wait(2):%d\n", errno);
         for (int i = 0; i < num_events; ++i) {
             if (events[i].data.ptr == NULL) {
                 has_read = 1;
@@ -1631,7 +1774,7 @@ static int wait_for_data(struct conn_ctx *conn_ctx, int cleanup)
                 int ret;
                 if ((ret = offload_resume(req)) != 0)
                     return ret;
-                if ((ret = send_responses(conn_ctx, 0)) != 0)
+                if ((ret = send_responses(0)) != 0)
                     return ret;
             }
         }
@@ -1647,7 +1790,7 @@ static int wait_for_data(struct conn_ctx *conn_ctx, int cleanup)
     while ((ret = select(fd + 1, &rfds, NULL, NULL, NULL)) == -1 && (errno == EAGAIN || errno == EINTR))
         ;
     if (ret == -1)
-        dief("select(2)\n");
+        dief("select(2):%d\n", errno);
 
 #endif
 
@@ -1660,8 +1803,8 @@ static int wait_for_data(struct conn_ctx *conn_ctx, int cleanup)
 
 static void *daemon_conn_thread(void *_sock_fd)
 {
-    struct conn_ctx conn_ctx = {.sockfd = (int)((char *)_sock_fd - (char *)NULL),
-                                .responses.next = &conn_ctx.responses.first};
+    conn_ctx.sockfd = (int)((char *)_sock_fd - (char *)NULL);
+    conn_ctx.responses.next = &conn_ctx.responses.first;
 
 #ifdef __linux
     if ((conn_ctx.epollfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
@@ -1686,7 +1829,7 @@ static void *daemon_conn_thread(void *_sock_fd)
     }
 
     while (1) {
-        if (wait_for_data(&conn_ctx, 0) != 0)
+        if (wait_for_data(0) != 0)
             break;
         neverbleed_iobuf_t *buf = malloc(sizeof(*buf));
         if (buf == NULL)
@@ -1705,13 +1848,13 @@ static void *daemon_conn_thread(void *_sock_fd)
         }
 #if !defined(OPENSSL_IS_BORINGSSL)
         if (strcmp(cmd, "priv_enc") == 0) {
-            if (offload_start(priv_enc_stub, buf, &conn_ctx) != 0)
+            if (offload_start(priv_enc_stub, buf) != 0)
                 break;
         } else if (strcmp(cmd, "priv_dec") == 0) {
-            if (offload_start(priv_dec_stub, buf, &conn_ctx) != 0)
+            if (offload_start(priv_dec_stub, buf) != 0)
                 break;
         } else if (strcmp(cmd, "sign") == 0) {
-            if (offload_start(sign_stub, buf, &conn_ctx) != 0)
+            if (offload_start(sign_stub, buf) != 0)
                 break;
 #ifdef NEVERBLEED_ECDSA
         } else if (strcmp(cmd, "ecdsa_sign") == 0) {
@@ -1724,10 +1867,10 @@ static void *daemon_conn_thread(void *_sock_fd)
             if (digestsign_stub(buf) != 0)
                 break;
         } else if (strcmp(cmd, "digestsign-rsa") == 0) {
-            if (offload_start(digestsign_stub, buf, &conn_ctx) != 0)
+            if (offload_start(digestsign_stub, buf) != 0)
                 break;
         } else if (strcmp(cmd, "decrypt") == 0) {
-            if (offload_start(decrypt_stub, buf, &conn_ctx) != 0)
+            if (offload_start(decrypt_stub, buf) != 0)
                 break;
         } else if (strcmp(cmd, "load_key") == 0) {
             if (load_key_stub(buf) != 0)
@@ -1751,14 +1894,14 @@ static void *daemon_conn_thread(void *_sock_fd)
         *conn_ctx.responses.next = buf;
         conn_ctx.responses.next = &buf->next;
         /* send responses if possible */
-        if (send_responses(&conn_ctx, 0) != 0)
+        if (send_responses(0) != 0)
             break;
     }
 
 Exit:
     /* run the loop while async ops are running */
     while (conn_ctx.responses.first != NULL)
-        wait_for_data(&conn_ctx, 1);
+        wait_for_data(1);
 
     close(conn_ctx.sockfd);
 #ifdef __linux
