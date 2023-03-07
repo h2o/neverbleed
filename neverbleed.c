@@ -39,8 +39,9 @@
 #include <unistd.h>
 #include <signal.h>
 #if defined(__linux__)
-#include <sys/syscall.h>
+#include <sys/epoll.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #elif defined(__APPLE__)
 #include <sys/ptrace.h>
 #elif defined(__FreeBSD__)
@@ -190,6 +191,16 @@ static void set_cloexec(int fd)
     if (fcntl(fd, F_SETFD, O_CLOEXEC) == -1)
         dief("failed to set O_CLOEXEC to fd %d", fd);
 }
+
+#ifdef __linux
+static int do_epoll_ctl(int epollfd, int op, int fd, struct epoll_event *event)
+{
+    int ret;
+    while ((ret = epoll_ctl(epollfd, op, fd, event) != 0) && errno == EINTR)
+        ;
+    return ret;
+}
+#endif
 
 static int read_nbytes(int fd, void *p, size_t sz)
 {
@@ -490,6 +501,9 @@ static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t *
 struct conn_ctx {
     size_t refcnt;
     int sockfd;
+#ifdef __linux
+    int epollfd;
+#endif
     struct {
         neverbleed_iobuf_t *first, **next;
     } responses;
@@ -500,6 +514,11 @@ struct conn_ctx {
 struct engine_request {
     int (*stub)(neverbleed_iobuf_t *);
     neverbleed_iobuf_t *buf;
+    struct {
+        ASYNC_WAIT_CTX *ctx;
+        ASYNC_JOB *job;
+        int fd;
+    } async;
     struct conn_ctx *conn_ctx;
     struct engine_request *next;
 };
@@ -518,15 +537,8 @@ static struct {
         size_t num_slots;
         size_t first_empty;
     } keys;
-    struct {
-        pthread_mutex_t lock;
-        pthread_cond_t cond;
-        struct engine_request *first, **next;
-    } engine_queue;
     neverbleed_t *nb;
-} daemon_vars = {
-    .keys = {.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX},
-    .engine_queue = {.lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER, .next = &daemon_vars.engine_queue.first}};
+} daemon_vars = {.keys = {.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX}};
 
 static void acquire_conn_ctx(struct conn_ctx *conn_ctx)
 {
@@ -550,6 +562,9 @@ static void free_conn_ctx(struct conn_ctx *conn_ctx)
     assert(conn_ctx->responses.first == NULL);
 
     close(conn_ctx->sockfd);
+#ifdef __linux
+    close(conn_ctx->epollfd);
+#endif
     free(conn_ctx);
 }
 
@@ -1545,6 +1560,20 @@ respond:
     return 0;
 }
 
+static void free_req(struct engine_request *req)
+{
+    if (req->async.ctx != NULL)
+        ASYNC_WAIT_CTX_free(req->async.ctx);
+    free_conn_ctx(req->conn_ctx);
+    free(req);
+}
+
+static int offload_jobfunc(void *_req)
+{
+    struct engine_request *req = *(void **)_req;
+    return req->stub(req->buf);
+}
+
 static int offload_stub(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *buf, struct conn_ctx *conn_ctx)
 {
     /* if engine is not used, run the stub synchronously */
@@ -1556,41 +1585,62 @@ static int offload_stub(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *b
     struct engine_request *req = malloc(sizeof(*req));
     if (req == NULL)
         dief("no memory");
-    *req = (struct engine_request){stub, buf, conn_ctx};
+    *req = (struct engine_request){
+        .stub = stub,
+        .buf = buf,
+        .async = {.ctx = ASYNC_WAIT_CTX_new(), .fd = -1},
+        .conn_ctx = conn_ctx};
+    if (req->async.ctx == NULL)
+        dief("failed to create ASYNC_WAIT_CTX\n");
     acquire_conn_ctx(conn_ctx);
 
-    pthread_mutex_lock(&daemon_vars.engine_queue.lock);
-    *daemon_vars.engine_queue.next = req;
-    daemon_vars.engine_queue.next = &req->next;
-    pthread_cond_signal(&daemon_vars.engine_queue.cond);
-    pthread_mutex_unlock(&daemon_vars.engine_queue.lock);
-
-    return 0;
-}
-
-static void *offload_thread(void *)
-{
-    while (1) {
-        struct engine_request *req;
-
-        /* wait for and detach a request */
-        pthread_mutex_lock(&daemon_vars.engine_queue.lock);
-        while ((req = daemon_vars.engine_queue.first) == NULL)
-            pthread_cond_wait(&daemon_vars.engine_queue.cond, &daemon_vars.engine_queue.lock);
-        if ((daemon_vars.engine_queue.first = req->next) == NULL)
-            daemon_vars.engine_queue.next = &daemon_vars.engine_queue.first;
-        pthread_mutex_unlock(&daemon_vars.engine_queue.lock);
-
-        /* process and submit response */
-        if (req->stub(req->buf) != 0)
-            dief("offload request failed");
-        submit_response(req->conn_ctx, req->buf, 1);
-
-        free_conn_ctx(req->conn_ctx);
-        free(req);
+    int ret;
+    switch (ASYNC_start_job(&req->async.job, req->async.ctx, &ret, offload_jobfunc, &req, sizeof(req))) {
+    case ASYNC_PAUSE: { /* operation running async; register fd and bail out */
+        size_t numfds;
+        if (!ASYNC_WAIT_CTX_get_all_fds(req->async.ctx, NULL, &numfds) || numfds != 1)
+            dief("unexpected number of fds (%zu) requested in async mode\n", numfds);
+        if (!ASYNC_WAIT_CTX_get_all_fds(req->async.ctx, &req->async.fd, &numfds))
+            dief("ASYNC_WAIT_CTX_get_all_fds failed\n");
+        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = req};
+        if (do_epoll_ctl(req->conn_ctx->epollfd, EPOLL_CTL_ADD, req->async.fd, &ev) != 0)
+            dief("epoll_ctl failed:%d\n", errno);
+        return 0;
+    } break;
+    case ASYNC_FINISH: /* completed synchronously */
+        break;
+    default:
+        dief("ASYNC_start_job errored\n");
+        break;
     }
 
-    return NULL;
+    free_req(req);
+
+    return ret;
+}
+
+static int offload_run(struct engine_request *req)
+{
+    int ret;
+
+    switch (ASYNC_start_job(&req->async.job, req->async.ctx, &ret, offload_jobfunc, req, sizeof(req))) {
+    case ASYNC_PAUSE:
+        /* assume that wait fd is unchanged */
+        return 0;
+    case ASYNC_FINISH:
+        if (do_epoll_ctl(req->conn_ctx->epollfd, EPOLL_CTL_DEL, req->async.fd, NULL) != 0)
+            dief("epoll_ctl failed:%d\n", errno);
+        break;
+    default:
+        dief("ASYNC_start_job failed\n");
+        break;
+    }
+
+    /* job done */
+    submit_response(req->conn_ctx, req->buf, 1);
+    free_req(req);
+
+    return ret;
 }
 
 /**
@@ -1598,8 +1648,34 @@ static void *offload_thread(void *)
  * The intention behind sleep is to provide the application to complete its event loop before the neverbleed process starts
  * spending CPU cycles on the time-consuming RSA operation.
  */
-static void yield_on_data(int fd)
+static int wait_for_read(struct conn_ctx *conn_ctx)
 {
+#ifdef __linux
+
+    struct epoll_event events[20];
+    int has_read = 0, num_events;
+
+    do {
+        while ((num_events = epoll_wait(conn_ctx->epollfd, events, sizeof(events) / sizeof(events[0]), -1)) == -1) {
+            if (errno != EINTR)
+                warnf("epoll_wait failed:%d\n", errno);
+        }
+        for (int i = 0; i < num_events; ++i) {
+            if (events[i].data.ptr == NULL) {
+                has_read = 1;
+            } else {
+                struct engine_request *req = events[i].data.ptr;
+                int ret;
+                if ((ret = offload_run(req)) != 0)
+                    return ret;
+            }
+        }
+    } while (!has_read);
+
+    return 0;
+
+#else
+
     fd_set rfds;
     int ret;
     FD_ZERO(&rfds);
@@ -1616,6 +1692,10 @@ static void yield_on_data(int fd)
     } else {
         dief("unreachable, no timeout configured");
     }
+
+    return 0;
+
+#endif
 }
 
 static void *daemon_conn_thread(void *_sock_fd)
@@ -1627,6 +1707,16 @@ static void *daemon_conn_thread(void *_sock_fd)
                                   .sockfd = (int)((char *)_sock_fd - (char *)NULL),
                                   .responses.next = &conn_ctx->responses.first,
                                   .mutex = PTHREAD_MUTEX_INITIALIZER};
+
+#ifdef __linux
+    if ((conn_ctx->epollfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
+        dief("epoll_create1 failed:%d\n", errno);
+    {
+        struct epoll_event ev = {.events = EPOLLIN};
+        if (do_epoll_ctl(conn_ctx->epollfd, EPOLL_CTL_ADD, conn_ctx->sockfd, &ev) != 0)
+            dief("epoll_ctl failed:%d\n", errno);
+    }
+#endif
 
     { /* authenticate */
         unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
@@ -1641,12 +1731,13 @@ static void *daemon_conn_thread(void *_sock_fd)
     }
 
     while (1) {
+        if (wait_for_read(conn_ctx) != 0)
+            break;
         neverbleed_iobuf_t *buf = malloc(sizeof(*buf));
         if (buf == NULL)
             dief("no memory");
         *buf = (neverbleed_iobuf_t){};
         char *cmd;
-        yield_on_data(conn_ctx->sockfd);
         if (iobuf_read(buf, conn_ctx->sockfd) != 0) {
             if (errno != 0)
                 warnf("read error");
@@ -1774,10 +1865,6 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
         if (!ENGINE_set_default_RSA(qat))
             dief("failed to assign RSA operations to QAT\n");
 #endif
-        for (unsigned i = 0; i < neverbleed_qat.jobs; ++i) {
-            if (pthread_create(&tid, &thattr, offload_thread, NULL) != 0)
-                dief("pthread_create failed");
-        }
     }
 
     if (pthread_create(&tid, &thattr, daemon_close_notify_thread, (char *)NULL + close_notify_fd) != 0)
