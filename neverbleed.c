@@ -1038,6 +1038,7 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const 
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
     struct st_neverbleed_thread_data_t *thdata;
+    const char *cmd = "digestsign";
 
     /* obtain reference */
     switch (EVP_PKEY_base_id(pkey)) {
@@ -1045,6 +1046,7 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const 
         RSA *rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
         get_privsep_data(rsa, &exdata, &thdata);
         RSA_free(rsa);
+        cmd = "digestsign-rsa";
     } break;
 #ifdef NEVERBLEED_ECDSA
     case EVP_PKEY_EC:
@@ -1057,7 +1059,7 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const 
     }
 
     *buf = (neverbleed_iobuf_t){NULL};
-    iobuf_push_str(buf, "digestsign");
+    iobuf_push_str(buf, cmd);
     iobuf_push_num(buf, exdata->key_index);
     iobuf_push_num(buf, md != NULL ? (size_t)EVP_MD_nid(md) : SIZE_MAX);
     iobuf_push_bytes(buf, input, len);
@@ -1719,6 +1721,9 @@ static void *daemon_conn_thread(void *_sock_fd)
         } else
 #endif
             if (strcmp(cmd, "digestsign") == 0) {
+            if (digestsign_stub(buf) != 0)
+                break;
+        } else if (strcmp(cmd, "digestsign-rsa") == 0) {
             if (offload_stub(digestsign_stub, buf, &conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "decrypt") == 0) {
