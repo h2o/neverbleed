@@ -71,6 +71,10 @@
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
 
+#if defined(OPENSSL_IS_BORINGSSL) && defined(NEVERBLEED_BORINGSSL_USE_QAT)
+#include "qat_bssl.h"
+#endif
+
 #if OPENSSL_VERSION_NUMBER < 0x1010000fL \
     || (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x2070000fL)
 
@@ -205,12 +209,19 @@ static int read_nbytes(int fd, void *p, size_t sz)
     return 0;
 }
 
+/**
+ * This function disposes of the memory allocated for `neverbleed_iobuf_t`, but retains the value of `next` and `processing` so that
+ * the buffer can be "cleared" while in use by worker threads.
+ */
 static void iobuf_dispose(neverbleed_iobuf_t *buf)
 {
     if (buf->capacity != 0)
         OPENSSL_cleanse(buf->buf, buf->capacity);
     free(buf->buf);
-    memset(buf, 0, sizeof(*buf));
+    buf->buf = NULL;
+    buf->start = NULL;
+    buf->end = NULL;
+    buf->capacity = 0;
 }
 
 static void iobuf_reserve(neverbleed_iobuf_t *buf, size_t extra)
@@ -476,6 +487,23 @@ static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t *
     *thdata = get_thread_data((*exdata)->nb);
 }
 
+struct conn_ctx {
+    size_t refcnt;
+    int sockfd;
+    struct {
+        neverbleed_iobuf_t *first, **next;
+    } responses;
+    unsigned write_errored : 1;
+    pthread_mutex_t mutex;
+};
+
+struct engine_request {
+    int (*stub)(neverbleed_iobuf_t *);
+    neverbleed_iobuf_t *buf;
+    struct conn_ctx *conn_ctx;
+    struct engine_request *next;
+};
+
 static struct {
     struct {
         pthread_mutex_t lock;
@@ -490,8 +518,69 @@ static struct {
         size_t num_slots;
         size_t first_empty;
     } keys;
+    struct {
+        pthread_mutex_t lock;
+        pthread_cond_t cond;
+        struct engine_request *first, **next;
+    } engine_queue;
     neverbleed_t *nb;
-} daemon_vars = {{.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX}};
+} daemon_vars = {
+    .keys = {.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX},
+    .engine_queue = {.lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER, .next = &daemon_vars.engine_queue.first}};
+
+static void acquire_conn_ctx(struct conn_ctx *conn_ctx)
+{
+    pthread_mutex_lock(&conn_ctx->mutex);
+    ++conn_ctx->refcnt;
+    pthread_mutex_unlock(&conn_ctx->mutex);
+}
+
+static void free_conn_ctx(struct conn_ctx *conn_ctx)
+{
+    int dispose = 0;
+
+    pthread_mutex_lock(&conn_ctx->mutex);
+    if (--conn_ctx->refcnt == 0)
+        dispose = 1;
+    pthread_mutex_unlock(&conn_ctx->mutex);
+
+    if (!dispose)
+        return;
+
+    assert(conn_ctx->responses.first == NULL);
+
+    close(conn_ctx->sockfd);
+    free(conn_ctx);
+}
+
+static void submit_response(struct conn_ctx *conn_ctx, neverbleed_iobuf_t *buf, int run_async)
+{
+    pthread_mutex_lock(&conn_ctx->mutex);
+
+    if (!run_async) {
+        *conn_ctx->responses.next = buf;
+        conn_ctx->responses.next = &buf->next;
+    } else {
+        buf->processing = 0;
+    }
+
+    /* Send all buffers that have data being filled. The lock is held until everything is being done, as this function can be called
+     * from multiple threads simultaneously. */
+    while ((buf = conn_ctx->responses.first) != NULL && !buf->processing) {
+        if ((conn_ctx->responses.first = buf->next) == NULL)
+            conn_ctx->responses.next = &conn_ctx->responses.first;
+        if (!conn_ctx->write_errored) {
+            if (iobuf_write(buf, conn_ctx->sockfd) != 0) {
+                warnf(errno != 0 ? "write error" : "connection closed by client");
+                conn_ctx->write_errored = 1;
+            }
+        }
+        iobuf_dispose(buf);
+        free(buf);
+    }
+
+    pthread_mutex_unlock(&conn_ctx->mutex);
+}
 
 static RSA *daemon_get_rsa(size_t key_index)
 {
@@ -1169,6 +1258,11 @@ static int load_key_stub(neverbleed_iobuf_t *buf)
         goto Respond;
     }
 
+#ifdef OPENSSL_IS_BORINGSSL
+    if (neverbleed_qat.jobs != 0 && bssl_private_key_method_update(pkey) != 0)
+        dief("failed to set callbacks");
+#endif
+
     switch (EVP_PKEY_base_id(pkey)) {
     case EVP_PKEY_RSA: {
         const BIGNUM *e, *n;
@@ -1451,6 +1545,54 @@ respond:
     return 0;
 }
 
+static int offload_stub(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *buf, struct conn_ctx *conn_ctx)
+{
+    /* if engine is not used, run the stub synchronously */
+    if (neverbleed_qat.jobs == 0)
+        return stub(buf);
+
+    buf->processing = 1;
+
+    struct engine_request *req = malloc(sizeof(*req));
+    if (req == NULL)
+        dief("no memory");
+    *req = (struct engine_request){stub, buf, conn_ctx};
+    acquire_conn_ctx(conn_ctx);
+
+    pthread_mutex_lock(&daemon_vars.engine_queue.lock);
+    *daemon_vars.engine_queue.next = req;
+    daemon_vars.engine_queue.next = &req->next;
+    pthread_cond_signal(&daemon_vars.engine_queue.cond);
+    pthread_mutex_unlock(&daemon_vars.engine_queue.lock);
+
+    return 0;
+}
+
+static void *offload_thread(void *)
+{
+    while (1) {
+        struct engine_request *req;
+
+        /* wait for and detach a request */
+        pthread_mutex_lock(&daemon_vars.engine_queue.lock);
+        while ((req = daemon_vars.engine_queue.first) == NULL)
+            pthread_cond_wait(&daemon_vars.engine_queue.cond, &daemon_vars.engine_queue.lock);
+        if ((daemon_vars.engine_queue.first = req->next) == NULL)
+            daemon_vars.engine_queue.next = &daemon_vars.engine_queue.first;
+        pthread_mutex_unlock(&daemon_vars.engine_queue.lock);
+
+        /* process and submit response */
+        if (req->stub(req->buf) != 0)
+            dief("offload request failed");
+        submit_response(req->conn_ctx, req->buf, 1);
+
+        free_conn_ctx(req->conn_ctx);
+        free(req);
+    }
+
+    return NULL;
+}
+
 /**
  * This function waits for the provided socket to become readable, then calls `nanosleep(1)` before returning.
  * The intention behind sleep is to provide the application to complete its event loop before the neverbleed process starts
@@ -1478,84 +1620,89 @@ static void yield_on_data(int fd)
 
 static void *daemon_conn_thread(void *_sock_fd)
 {
-    int sock_fd = (int)((char *)_sock_fd - (char *)NULL);
-    neverbleed_iobuf_t buf = {NULL};
-    unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
+    struct conn_ctx *conn_ctx = malloc(sizeof(*conn_ctx));
+    if (conn_ctx == NULL)
+        dief("no memory");
+    *conn_ctx = (struct conn_ctx){.refcnt = 1,
+                                  .sockfd = (int)((char *)_sock_fd - (char *)NULL),
+                                  .responses.next = &conn_ctx->responses.first,
+                                  .mutex = PTHREAD_MUTEX_INITIALIZER};
 
-    /* authenticate */
-    if (read_nbytes(sock_fd, &auth_token, sizeof(auth_token)) != 0) {
-        warnf("failed to receive authencication token from client");
-        goto Exit;
-    }
-    if (memcmp(auth_token, daemon_vars.nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE) != 0) {
-        warnf("client authentication failed");
-        goto Exit;
+    { /* authenticate */
+        unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
+        if (read_nbytes(conn_ctx->sockfd, &auth_token, sizeof(auth_token)) != 0) {
+            warnf("failed to receive authencication token from client");
+            goto Exit;
+        }
+        if (memcmp(auth_token, daemon_vars.nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE) != 0) {
+            warnf("client authentication failed");
+            goto Exit;
+        }
     }
 
     while (1) {
+        neverbleed_iobuf_t *buf = malloc(sizeof(*buf));
+        if (buf == NULL)
+            dief("no memory");
+        *buf = (neverbleed_iobuf_t){};
         char *cmd;
-        yield_on_data(sock_fd);
-        if (iobuf_read(&buf, sock_fd) != 0) {
+        yield_on_data(conn_ctx->sockfd);
+        if (iobuf_read(buf, conn_ctx->sockfd) != 0) {
             if (errno != 0)
                 warnf("read error");
             break;
         }
-        if ((cmd = iobuf_shift_str(&buf)) == NULL) {
+        if ((cmd = iobuf_shift_str(buf)) == NULL) {
             errno = 0;
             warnf("failed to parse request");
             break;
         }
 #if !defined(OPENSSL_IS_BORINGSSL)
         if (strcmp(cmd, "priv_enc") == 0) {
-            if (priv_enc_stub(&buf) != 0)
+            if (offload_stub(priv_enc_stub, buf, conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "priv_dec") == 0) {
-            if (priv_dec_stub(&buf) != 0)
+            if (offload_stub(priv_dec_stub, buf, conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "sign") == 0) {
-            if (sign_stub(&buf) != 0)
+            if (offload_stub(sign_stub, buf, conn_ctx) != 0)
                 break;
 #ifdef NEVERBLEED_ECDSA
         } else if (strcmp(cmd, "ecdsa_sign") == 0) {
-            if (ecdsa_sign_stub(&buf) != 0)
+            if (ecdsa_sign_stub(buf) != 0)
                 break;
 #endif
         } else
 #endif
             if (strcmp(cmd, "digestsign") == 0) {
-            if (digestsign_stub(&buf) != 0)
+            if (offload_stub(digestsign_stub, buf, conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "decrypt") == 0) {
-            if (decrypt_stub(&buf) != 0)
+            if (offload_stub(decrypt_stub, buf, conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "load_key") == 0) {
-            if (load_key_stub(&buf) != 0)
+            if (load_key_stub(buf) != 0)
                 break;
         } else if (strcmp(cmd, "del_pkey") == 0) {
-            if (del_pkey_stub(&buf) != 0)
+            if (del_pkey_stub(buf) != 0)
                 break;
         } else if (strcmp(cmd, "setuidgid") == 0) {
-            if (setuidgid_stub(&buf) != 0)
+            if (setuidgid_stub(buf) != 0)
                 break;
 #if NEVERBLEED_HAS_PTHREAD_SETAFFINITY_NP
         } else if (strcmp(cmd, "setaffinity") == 0) {
-            if (setaffinity_stub(&buf) != 0)
+            if (setaffinity_stub(buf) != 0)
                 break;
 #endif
         } else {
             warnf("unknown command:%s", cmd);
             break;
         }
-        if (iobuf_write(&buf, sock_fd) != 0) {
-            warnf(errno != 0 ? "write error" : "connection closed by client");
-            break;
-        }
-        iobuf_dispose(&buf);
+        submit_response(conn_ctx, buf, 0);
     }
 
 Exit:
-    iobuf_dispose(&buf);
-    close(sock_fd);
+    free_conn_ctx(conn_ctx);
 
     return NULL;
 }
@@ -1610,6 +1757,28 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
     cleanup_fds(listen_fd, close_notify_fd);
     pthread_attr_init(&thattr);
     pthread_attr_setdetachstate(&thattr, 1);
+
+    if (neverbleed_qat.jobs != 0) {
+#ifdef OPENSSL_IS_BORINGSSL
+#ifdef NEVERBLEED_BORINGSSL_USE_QAT
+        ENGINE_load_qat();
+        bssl_qat_set_default_string("RSA");
+#else
+        dief("QAT is not supported\n");
+#endif
+#else
+        ENGINE *qat = ENGINE_by_id("qatengine");
+        assert(qat != NULL);
+        if (!ENGINE_init(qat))
+            dief("failed to initialize QAT\n");
+        if (!ENGINE_set_default_RSA(qat))
+            dief("failed to assign RSA operations to QAT\n");
+#endif
+        for (unsigned i = 0; i < neverbleed_qat.jobs; ++i) {
+            if (pthread_create(&tid, &thattr, offload_thread, NULL) != 0)
+                dief("pthread_create failed");
+        }
+    }
 
     if (pthread_create(&tid, &thattr, daemon_close_notify_thread, (char *)NULL + close_notify_fd) != 0)
         dief("pthread_create failed");
@@ -1797,3 +1966,4 @@ Fail:
 
 void (*neverbleed_post_fork_cb)(void) = NULL;
 void (*neverbleed_transaction_cb)(neverbleed_iobuf_t *) = NULL;
+struct neverbleed_qat neverbleed_qat = {.jobs = 100};
