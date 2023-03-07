@@ -1538,7 +1538,7 @@ static int offload_jobfunc(void *_req)
     return req->stub(req->buf);
 }
 
-static int offload_stub(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *buf, struct conn_ctx *conn_ctx)
+static int offload_start(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *buf, struct conn_ctx *conn_ctx)
 {
     /* if engine is not used, run the stub synchronously */
     if (!neverbleed_qat)
@@ -1582,7 +1582,7 @@ static int offload_stub(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *b
     return ret;
 }
 
-static int offload_run(struct engine_request *req)
+static int offload_resume(struct engine_request *req)
 {
     int ret;
 
@@ -1629,7 +1629,7 @@ static int wait_for_data(struct conn_ctx *conn_ctx, int cleanup)
             } else {
                 struct engine_request *req = events[i].data.ptr;
                 int ret;
-                if ((ret = offload_run(req)) != 0)
+                if ((ret = offload_resume(req)) != 0)
                     return ret;
                 if ((ret = send_responses(conn_ctx, 0)) != 0)
                     return ret;
@@ -1705,13 +1705,13 @@ static void *daemon_conn_thread(void *_sock_fd)
         }
 #if !defined(OPENSSL_IS_BORINGSSL)
         if (strcmp(cmd, "priv_enc") == 0) {
-            if (offload_stub(priv_enc_stub, buf, &conn_ctx) != 0)
+            if (offload_start(priv_enc_stub, buf, &conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "priv_dec") == 0) {
-            if (offload_stub(priv_dec_stub, buf, &conn_ctx) != 0)
+            if (offload_start(priv_dec_stub, buf, &conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "sign") == 0) {
-            if (offload_stub(sign_stub, buf, &conn_ctx) != 0)
+            if (offload_start(sign_stub, buf, &conn_ctx) != 0)
                 break;
 #ifdef NEVERBLEED_ECDSA
         } else if (strcmp(cmd, "ecdsa_sign") == 0) {
@@ -1724,10 +1724,10 @@ static void *daemon_conn_thread(void *_sock_fd)
             if (digestsign_stub(buf) != 0)
                 break;
         } else if (strcmp(cmd, "digestsign-rsa") == 0) {
-            if (offload_stub(digestsign_stub, buf, &conn_ctx) != 0)
+            if (offload_start(digestsign_stub, buf, &conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "decrypt") == 0) {
-            if (offload_stub(decrypt_stub, buf, &conn_ctx) != 0)
+            if (offload_start(decrypt_stub, buf, &conn_ctx) != 0)
                 break;
         } else if (strcmp(cmd, "load_key") == 0) {
             if (load_key_stub(buf) != 0)
