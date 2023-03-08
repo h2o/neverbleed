@@ -1018,7 +1018,7 @@ static EVP_PKEY *daemon_get_pkey(size_t key_index)
     return pkey;
 }
 
-#ifdef OPENSSL_IS_BORINGSSL
+#if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
 
 static void bssl_offload_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const EVP_MD *md, const void *signdata,
                                     size_t signlen)
@@ -1105,7 +1105,7 @@ static int digestsign_stub(neverbleed_iobuf_t *buf)
         md = NULL;
     }
 
-#ifdef OPENSSL_IS_BORINGSSL
+#if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
     if (neverbleed_qat && EVP_PKEY_id(pkey) == EVP_PKEY_RSA) {
         bssl_offload_digestsign(buf, pkey, md, signdata, signlen);
         return 0;
@@ -1359,7 +1359,7 @@ static int load_key_stub(neverbleed_iobuf_t *buf)
         goto Respond;
     }
 
-#ifdef OPENSSL_IS_BORINGSSL
+#if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
     if (neverbleed_qat && bssl_private_key_method_update(pkey) != 0)
         dief("failed to set callbacks");
 #endif
@@ -1971,7 +1971,7 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
     pthread_attr_setdetachstate(&thattr, 1);
 
     if (neverbleed_qat) {
-#if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL) && defined(NEVERBLEED_BORINGSSL_USE_QAT)
+#if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
         ENGINE_load_qat();
         bssl_qat_set_default_string("RSA");
 #elif USE_OFFLOAD && !defined(OPENSSL_IS_BORINGSSL)
