@@ -1359,11 +1359,6 @@ static int load_key_stub(neverbleed_iobuf_t *buf)
         goto Respond;
     }
 
-#if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
-    if (neverbleed_qat && bssl_private_key_method_update(pkey) != 0)
-        dief("failed to set callbacks");
-#endif
-
     switch (EVP_PKEY_base_id(pkey)) {
     case EVP_PKEY_RSA: {
         const BIGNUM *e, *n;
