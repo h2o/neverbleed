@@ -1989,8 +1989,6 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
         assert(qat != NULL);
         if (!ENGINE_init(qat))
             dief("failed to initialize QAT\n");
-        if (!ENGINE_set_default_RSA(qat))
-            dief("failed to assign RSA operations to QAT\n");
 #else
         dief("QAT is not supported\n");
 #endif
