@@ -532,17 +532,14 @@ struct engine_request {
     neverbleed_iobuf_t *buf;
     int async_fd;
 #ifdef OPENSSL_IS_BORINGSSL
-    enum {
-        ENGINE_REQUEST_TYPE_DIGESTSIGN,
-        ENGINE_REQUEST_TYPE_DECRYPT,
-    } type;
-    union {
-        struct {
-            RSA *rsa;
-            uint8_t padded[512];
-            size_t padded_len;
-            uint8_t signature[512];
-        } digestsign;
+    struct {
+        RSA *rsa;
+        uint8_t output[512];
+        union {
+            struct {
+                uint8_t padded[512];
+            } digestsign;
+        };
     } data;
     async_ctx *async_ctx;
 #else
@@ -1020,6 +1017,23 @@ static EVP_PKEY *daemon_get_pkey(size_t key_index)
 
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
 
+static struct engine_request *bssl_offload_create_request(neverbleed_iobuf_t *buf, EVP_PKEY *pkey)
+{
+    RSA *_rsa = EVP_PKEY_get1_RSA(pkey);
+
+    struct engine_request *req = malloc(sizeof(*req));
+    if (req == NULL)
+        dief("no memory\n");
+    *req = (struct engine_request){.buf = buf, .async_fd = -1, .async_ctx = bssl_qat_async_start_job(), .data.rsa = _rsa};
+
+    if (req->async_ctx == NULL)
+        dief("failed to initialize async job\n");
+    if (RSA_size(req->data.rsa) > sizeof(req->data.output))
+        dief("RSA key too large\n");
+
+    return req;
+}
+
 static void bssl_offload_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const EVP_MD *md, const void *signdata,
                                     size_t signlen)
 {
@@ -1037,23 +1051,10 @@ static void bssl_offload_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, con
         EVP_MD_CTX_free(mdctx);
     }
 
-    /* instantiate request context */
-    RSA *_rsa = EVP_PKEY_get1_RSA(pkey);
-    struct engine_request *req = malloc(sizeof(*req));
-    if (req == NULL)
-        dief("no memory\n");
-    *req = (struct engine_request){.buf = buf,
-                                   .async_fd = -1,
-                                   .async_ctx = bssl_qat_async_start_job(),
-                                   .type = ENGINE_REQUEST_TYPE_DIGESTSIGN,
-                                   .data.digestsign = {.rsa = _rsa, .padded_len = RSA_size(_rsa)}};
-    if (req->async_ctx == NULL)
-        dief("failed to initialize async job\n");
-    if (sizeof(req->data.digestsign.padded) < req->data.digestsign.padded_len)
-        dief("RSA key too large:%zu\n", req->data.digestsign.padded_len);
+    struct engine_request *req = bssl_offload_create_request(buf, pkey);
 
     /* generate padded octets to be signed */
-    if (!RSA_padding_add_PKCS1_PSS_mgf1(req->data.digestsign.rsa, req->data.digestsign.padded, digest, md, md, -1))
+    if (!RSA_padding_add_PKCS1_PSS_mgf1(req->data.rsa, req->data.digestsign.padded, digest, md, md, -1))
         dief("RSA_paddding_add_PKCS1_PSS_mgf1 failed\n");
 
     OPENSSL_cleanse(digest, sizeof(digest));
@@ -1062,13 +1063,30 @@ static void bssl_offload_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, con
     RSA_METHOD *meth = bssl_engine_get_rsa_method();
     if (meth == NULL)
         dief("failed to obtain QAT RSA method table\n");
-
-    size_t siglen;
-    if (!meth->sign_raw(req->data.digestsign.rsa, &siglen, req->data.digestsign.signature, req->data.digestsign.padded_len,
-                        req->data.digestsign.padded, req->data.digestsign.padded_len, RSA_NO_PADDING))
+    size_t siglen, padded_len = RSA_size(req->data.rsa);
+    if (!meth->sign_raw(req->data.rsa, &siglen, req->data.output, padded_len, req->data.digestsign.padded, padded_len,
+                        RSA_NO_PADDING))
         dief("sign_raw failure\n");
     if (siglen != 0)
-        dief("sign_raw completed synchronously unexpectedly");
+        dief("sign_raw completed synchronously unexpectedly\n");
+
+    buf->processing = 1;
+    register_wait_fd(req);
+}
+
+static void bssl_offload_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const void *src, size_t len)
+{
+    struct engine_request *req = bssl_offload_create_request(buf, pkey);
+
+    /* dispatch RSA calculation */
+    RSA_METHOD *meth = bssl_engine_get_rsa_method();
+    if (meth == NULL)
+        dief("failed to obtain QAT RSA method table\n");
+    size_t outlen;
+    if (!meth->decrypt(req->data.rsa, &outlen, req->data.output, len, src, len, RSA_NO_PADDING))
+        dief("RSA decrypt failure\n");
+    if (outlen != 0)
+        dief("RSA decrypt completed synchronously unexppctedly\n");
 
     buf->processing = 1;
     register_wait_fd(req);
@@ -1225,6 +1243,13 @@ static int decrypt_stub(neverbleed_iobuf_t *buf)
     rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
     assert(rsa != NULL);
     assert(sizeof(decryptbuf) >= RSA_size(rsa));
+
+#if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
+    if (neverbleed_qat) {
+        bssl_offload_decrypt(buf, pkey, src, srclen);
+        return 0;
+    }
+#endif
 
     if ((decryptlen = RSA_private_decrypt(srclen, src, decryptbuf, rsa, RSA_NO_PADDING)) == -1) {
         errno = 0;
@@ -1648,32 +1673,21 @@ respond:
 
 static int offload_resume(struct engine_request *req)
 {
+    size_t outlen;
+
     if (do_epoll_ctl(conn_ctx.epollfd, EPOLL_CTL_DEL, req->async_fd, NULL) != 0)
         dief("epoll_ctl failed:%d\n", errno);
 
-    switch (req->type) {
-
-    case ENGINE_REQUEST_TYPE_DIGESTSIGN: {
-        size_t siglen;
-        /* get signture */
-        if (bssl_qat_async_ctx_copy_result(req->async_ctx, req->data.digestsign.signature, &siglen,
-                                           sizeof(req->data.digestsign.signature)) != 0)
-            dief("failed to obtain offload result\n");
-        if (siglen > sizeof(req->data.digestsign.signature))
-            dief("RSA signature unexpectedly large\n");
-        /* save the result */
-        iobuf_dispose(req->buf);
-        iobuf_push_bytes(req->buf, req->data.digestsign.signature, siglen);
-        /* cleanup */
-        RSA_free(req->data.digestsign.rsa);
-        req->data.digestsign.rsa = NULL;
-    } break;
-
-    default:
-        dief("FIXME");
-        break;
-
-    }
+    /* get result */
+    if (bssl_qat_async_ctx_copy_result(req->async_ctx, req->data.output, &outlen, sizeof(req->data.output)) != 0)
+        dief("failed to obtain offload result\n");
+    if (outlen > sizeof(req->data.output))
+        dief("RSA output is unexpectedly large\n");
+    /* save the result */
+    iobuf_dispose(req->buf);
+    iobuf_push_bytes(req->buf, req->data.output, outlen);
+    /* cleanup */
+    RSA_free(req->data.rsa);
 
     req->buf->processing = 0;
     free_req(req);
