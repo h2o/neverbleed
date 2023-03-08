@@ -526,6 +526,8 @@ static __thread struct {
     } responses;
 } conn_ctx;
 
+static int use_offload = 0;
+
 #if USE_OFFLOAD
 
 struct engine_request {
@@ -1124,7 +1126,7 @@ static int digestsign_stub(neverbleed_iobuf_t *buf)
     }
 
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
-    if (neverbleed_qat && EVP_PKEY_id(pkey) == EVP_PKEY_RSA) {
+    if (use_offload && EVP_PKEY_id(pkey) == EVP_PKEY_RSA) {
         bssl_offload_digestsign(buf, pkey, md, signdata, signlen);
         return 0;
     }
@@ -1245,7 +1247,7 @@ static int decrypt_stub(neverbleed_iobuf_t *buf)
     assert(sizeof(decryptbuf) >= RSA_size(rsa));
 
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
-    if (neverbleed_qat) {
+    if (use_offload) {
         bssl_offload_decrypt(buf, pkey, src, srclen);
         return 0;
     }
@@ -1707,7 +1709,7 @@ static int offload_jobfunc(void *_req)
 static int offload_start(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *buf)
 {
     /* if engine is not used, run the stub synchronously */
-    if (!neverbleed_qat)
+    if (!use_offload)
         return stub(buf);
 
     buf->processing = 1;
@@ -1980,18 +1982,23 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
     pthread_attr_init(&thattr);
     pthread_attr_setdetachstate(&thattr, 1);
 
-    if (neverbleed_qat) {
+    switch (neverbleed_offload) {
+    case NEVERBLEED_OFFLOAD_QAT_ON:
+    case NEVERBLEED_OFFLOAD_QAT_AUTO:
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
         ENGINE_load_qat();
         bssl_qat_set_default_string("RSA");
+        use_offload = ENGINE_QAT_PTR_GET() != NULL;
 #elif USE_OFFLOAD && !defined(OPENSSL_IS_BORINGSSL)
         ENGINE *qat = ENGINE_by_id("qatengine");
-        assert(qat != NULL);
-        if (!ENGINE_init(qat))
-            dief("failed to initialize QAT\n");
-#else
-        dief("QAT is not supported\n");
+        if (qat != NULL && ENGINE_init(qat))
+            use_offload = 1;
 #endif
+        if (!use_offload && neverbleed_offload == NEVERBLEED_OFFLOAD_QAT_ON)
+            dief("use of QAT is forced but unavailable\n");
+        break;
+    default:
+        break;
     }
 
     if (pthread_create(&tid, &thattr, daemon_close_notify_thread, (char *)NULL + close_notify_fd) != 0)
@@ -2180,4 +2187,4 @@ Fail:
 
 void (*neverbleed_post_fork_cb)(void) = NULL;
 void (*neverbleed_transaction_cb)(neverbleed_iobuf_t *) = NULL;
-int neverbleed_qat = 0;
+enum neverbleed_offload_type neverbleed_offload = NEVERBLEED_OFFLOAD_OFF;
