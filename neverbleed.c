@@ -1754,6 +1754,7 @@ static int offload_resume(struct engine_request *req)
  * This function waits for the provided socket to become readable, then calls `nanosleep(1)` before returning.
  * The intention behind sleep is to provide the application to complete its event loop before the neverbleed process starts
  * spending CPU cycles on the time-consuming RSA operation.
+ * In addition, when QAT is used, this function processes completion notifications from QAT and sends the responses.
  */
 static int wait_for_data(int cleanup)
 {
