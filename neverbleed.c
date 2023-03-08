@@ -1991,8 +1991,11 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
         use_offload = ENGINE_QAT_PTR_GET() != NULL;
 #elif USE_OFFLOAD && !defined(OPENSSL_IS_BORINGSSL)
         ENGINE *qat = ENGINE_by_id("qatengine");
-        if (qat != NULL && ENGINE_init(qat))
+        if (qat != NULL && ENGINE_init(qat)) {
+            if (!ENGINE_set_default_RSA(qat))
+                dief("failed to assign RSA operations to QAT\n");
             use_offload = 1;
+        }
 #endif
         if (!use_offload && neverbleed_offload == NEVERBLEED_OFFLOAD_QAT_ON)
             dief("use of QAT is forced but unavailable\n");
