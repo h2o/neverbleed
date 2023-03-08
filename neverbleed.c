@@ -514,7 +514,7 @@ static struct {
         size_t first_empty;
     } keys;
     neverbleed_t *nb;
-} daemon_vars = {.keys = {.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX}};
+} daemon_vars = {{.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX}};
 
 static __thread struct {
     int sockfd;
