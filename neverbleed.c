@@ -1985,17 +1985,24 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
     switch (neverbleed_offload) {
     case NEVERBLEED_OFFLOAD_QAT_ON:
     case NEVERBLEED_OFFLOAD_QAT_AUTO:
-#if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
+#if USE_OFFLOAD
+#ifdef OPENSSL_IS_BORINGSSL
         ENGINE_load_qat();
-        bssl_qat_set_default_string("RSA");
+        if (ENGINE_QAT_PTR_GET() == NULL)
+            ERR_print_errors_fp(stderr);
         use_offload = ENGINE_QAT_PTR_GET() != NULL;
-#elif USE_OFFLOAD && !defined(OPENSSL_IS_BORINGSSL)
+#else
         ENGINE *qat = ENGINE_by_id("qatengine");
         if (qat != NULL && ENGINE_init(qat)) {
             if (!ENGINE_set_default_RSA(qat))
                 dief("failed to assign RSA operations to QAT\n");
             use_offload = 1;
+        } else {
+            ERR_print_errors_fp(stderr);
         }
+#endif
+#else
+        fprintf(stderr, "neverbleed was built without QAT support\n");
 #endif
         if (!use_offload && neverbleed_offload == NEVERBLEED_OFFLOAD_QAT_ON)
             dief("use of QAT is forced but unavailable\n");
