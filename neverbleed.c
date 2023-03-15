@@ -384,7 +384,7 @@ static void iobuf_transaction_read(neverbleed_iobuf_t *buf, struct st_neverbleed
 static void iobuf_transaction_no_response(neverbleed_iobuf_t *buf, struct st_neverbleed_thread_data_t *thdata)
 {
     if (neverbleed_transaction_cb != NULL) {
-        neverbleed_transaction_cb(buf, 0);
+        neverbleed_transaction_cb(buf, 1);
     } else {
         iobuf_transaction_write(buf, thdata);
         iobuf_dispose(buf);
@@ -397,7 +397,7 @@ static void iobuf_transaction_no_response(neverbleed_iobuf_t *buf, struct st_nev
 static void iobuf_transaction(neverbleed_iobuf_t *buf, struct st_neverbleed_thread_data_t *thdata)
 {
     if (neverbleed_transaction_cb != NULL) {
-        neverbleed_transaction_cb(buf, 1);
+        neverbleed_transaction_cb(buf, 0);
     } else {
         iobuf_transaction_write(buf, thdata);
         iobuf_transaction_read(buf, thdata);
