@@ -350,6 +350,11 @@ static int iobuf_read(neverbleed_iobuf_t *buf, int fd)
     return 0;
 }
 
+void neverbleed_iobuf_dispose(neverbleed_iobuf_t *buf)
+{
+    iobuf_dispose(buf);
+}
+
 static void iobuf_transaction_write(neverbleed_iobuf_t *buf, struct st_neverbleed_thread_data_t *thdata)
 {
     if (iobuf_write(buf, thdata->fd) == -1) {
@@ -498,11 +503,6 @@ void neverbleed_transaction_write(neverbleed_t *nb, neverbleed_iobuf_t *buf)
 {
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
     iobuf_transaction_write(buf, thdata);
-}
-
-void neverbleed_transaction_dispose(neverbleed_iobuf_t *buf)
-{
-    iobuf_dispose(buf);
 }
 
 static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t **exdata,
