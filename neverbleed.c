@@ -1859,6 +1859,7 @@ static void *daemon_conn_thread(void *_sock_fd)
     while (1) {
         if (wait_for_data(0) != 0)
             break;
+        free(buf);
         buf = malloc(sizeof(*buf));
         if (buf == NULL)
             dief("no memory");
@@ -1907,7 +1908,6 @@ static void *daemon_conn_thread(void *_sock_fd)
             if (del_pkey_stub(buf) != 0)
                 break;
             iobuf_dispose(buf);
-            free(buf);
             // "del_pkey" command is fire-and-forget, it cannot fail, so doesn't have a response
             continue;
         } else if (strcmp(cmd, "setuidgid") == 0) {
