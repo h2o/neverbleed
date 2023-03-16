@@ -1754,7 +1754,7 @@ static int offload_resume(struct engine_request *req)
 {
     int ret;
 
-    switch (ASYNC_start_job(&req->async.job, req->async.ctx, &ret, offload_jobfunc, req, sizeof(req))) {
+    switch (ASYNC_start_job(&req->async.job, req->async.ctx, &ret, offload_jobfunc, &req, sizeof(req))) {
     case ASYNC_PAUSE:
         /* assume that wait fd is unchanged */
         return 0;
