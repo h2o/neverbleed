@@ -50,6 +50,9 @@
 #include <priv.h>
 #endif
 
+/* to maximize code-reuse between different stacks, we intentionally use API declared by OpenSSL as legacy */
+#define OPENSSL_SUPPRESS_DEPRECATED
+
 #include <openssl/opensslconf.h>
 #include <openssl/opensslv.h>
 
