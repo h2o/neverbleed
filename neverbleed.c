@@ -527,7 +527,7 @@ void neverbleed_transaction_write(neverbleed_t *nb, neverbleed_iobuf_t *buf)
     iobuf_transaction_write(buf, thdata);
 }
 
-static void _exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
+static void do_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
 {
     assert(ptr != NULL);
     struct st_neverbleed_rsa_exdata_t *exdata = ptr;
@@ -542,24 +542,42 @@ static void _exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, i
     free(exdata);
 }
 
-static volatile int rsa_exdata_idx = -1;
+static int get_rsa_exdata_idx(void);
 static void rsa_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
 {
-    if (idx != rsa_exdata_idx) return;
-    _exdata_free_callback(parent, ptr, ad, idx, argl, argp);
+    assert(idx == get_rsa_exdata_idx());
+    do_exdata_free_callback(parent, ptr, ad, idx, argl, argp);
 }
 
-static volatile int ecdsa_exdata_idx = -1;
+static int get_rsa_exdata_idx(void)
+{
+    static volatile int index;
+    NEVERBLEED_MULTITHREAD_ONCE({
+        index = RSA_get_ex_new_index(0, NULL, NULL, NULL, rsa_exdata_free_callback);
+    });
+    return index;
+}
+
+static int get_ecdsa_exdata_idx(void);
 static void ecdsa_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
 {
-    if (idx != ecdsa_exdata_idx) return;
-    _exdata_free_callback(parent, ptr, ad, idx, argl, argp);
+    assert(idx == get_ecdsa_exdata_idx());
+    do_exdata_free_callback(parent, ptr, ad, idx, argl, argp);
+}
+
+static int get_ecdsa_exdata_idx(void)
+{
+    static volatile int index;
+    NEVERBLEED_MULTITHREAD_ONCE({
+        index = EC_KEY_get_ex_new_index(0, NULL, NULL, NULL, ecdsa_exdata_free_callback);
+    });
+    return index;
 }
 
 static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t **exdata,
                              struct st_neverbleed_thread_data_t **thdata)
 {
-    *exdata = RSA_get_ex_data(rsa, rsa_exdata_idx);
+    *exdata = RSA_get_ex_data(rsa, get_rsa_exdata_idx());
     if (*exdata == NULL) {
         errno = 0;
         dief("invalid internal ref");
@@ -888,11 +906,7 @@ static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebu
     exdata->key_index = key_index;
 
     rsa = RSA_new_method(nb->engine);
-    NEVERBLEED_MULTITHREAD_ONCE({
-        ecdsa_exdata_idx = RSA_get_ex_new_index(0, NULL, NULL, NULL, ecdsa_exdata_free_callback);
-    });
-    RSA_set_ex_data(rsa, ecdsa_exdata_idx, exdata);
-
+    RSA_set_ex_data(rsa, get_rsa_exdata_idx(), exdata);
     if (BN_hex2bn(&e, ebuf) == 0) {
         fprintf(stderr, "failed to parse e:%s\n", ebuf);
         abort();
@@ -960,7 +974,7 @@ static int ecdsa_sign_stub(neverbleed_iobuf_t *buf)
 static void ecdsa_get_privsep_data(const EC_KEY *ec_key, struct st_neverbleed_rsa_exdata_t **exdata,
                                    struct st_neverbleed_thread_data_t **thdata)
 {
-    *exdata = EC_KEY_get_ex_data(ec_key, ecdsa_exdata_idx);
+    *exdata = EC_KEY_get_ex_data(ec_key, get_ecdsa_exdata_idx());
     if (*exdata == NULL) {
         errno = 0;
         dief("invalid internal ref");
@@ -1020,10 +1034,7 @@ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve
     exdata->key_index = key_index;
 
     ec_key = EC_KEY_new_method(nb->engine);
-    NEVERBLEED_MULTITHREAD_ONCE({
-        rsa_exdata_idx = EC_KEY_get_ex_new_index(0, NULL, NULL, NULL, rsa_exdata_free_callback);
-    });
-    EC_KEY_set_ex_data(ec_key, rsa_exdata_idx, exdata);
+    EC_KEY_set_ex_data(ec_key, get_ecdsa_exdata_idx(), exdata);
 
     ec_group = EC_GROUP_new_by_curve_name(curve_name);
     if (!ec_group) {
