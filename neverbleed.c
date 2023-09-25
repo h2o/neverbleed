@@ -1737,6 +1737,7 @@ static int offload_start(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *
         register_wait_fd(req);
         return 0;
     case ASYNC_FINISH: /* completed synchronously */
+        buf->processing = 0;
         break;
     default:
         dief("ASYNC_start_job errored\n");
