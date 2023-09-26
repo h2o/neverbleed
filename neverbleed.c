@@ -557,23 +557,6 @@ static int get_rsa_exdata_idx(void)
     });
     return index;
 }
-
-static int get_ecdsa_exdata_idx(void);
-static void ecdsa_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
-{
-    assert(idx == get_ecdsa_exdata_idx());
-    do_exdata_free_callback(parent, ptr, ad, idx, argl, argp);
-}
-
-static int get_ecdsa_exdata_idx(void)
-{
-    static volatile int index;
-    NEVERBLEED_MULTITHREAD_ONCE({
-        index = EC_KEY_get_ex_new_index(0, NULL, NULL, NULL, ecdsa_exdata_free_callback);
-    });
-    return index;
-}
-
 static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t **exdata,
                              struct st_neverbleed_thread_data_t **thdata)
 {
@@ -969,6 +952,22 @@ static int ecdsa_sign_stub(neverbleed_iobuf_t *buf)
     iobuf_push_bytes(buf, sigret, ret == 1 ? siglen : 0);
 
     return 0;
+}
+
+static int get_ecdsa_exdata_idx(void);
+static void ecdsa_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
+{
+    assert(idx == get_ecdsa_exdata_idx());
+    do_exdata_free_callback(parent, ptr, ad, idx, argl, argp);
+}
+
+static int get_ecdsa_exdata_idx(void)
+{
+    static volatile int index;
+    NEVERBLEED_MULTITHREAD_ONCE({
+        index = EC_KEY_get_ex_new_index(0, NULL, NULL, NULL, ecdsa_exdata_free_callback);
+    });
+    return index;
 }
 
 static void ecdsa_get_privsep_data(const EC_KEY *ec_key, struct st_neverbleed_rsa_exdata_t **exdata,
