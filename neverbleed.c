@@ -1219,7 +1219,7 @@ static int digestsign_stub(neverbleed_iobuf_t *buf)
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
     if (use_offload && EVP_PKEY_id(pkey) == EVP_PKEY_RSA) {
         bssl_offload_digestsign(buf, pkey, md, signdata, signlen, rsa_pss);
-        return 0;
+        goto Exit;
     }
 #endif
 
@@ -1257,6 +1257,7 @@ Respond: /* build response */
     iobuf_push_bytes(buf, digestbuf, digestlen);
     if (mdctx != NULL)
         EVP_MD_CTX_destroy(mdctx);
+Exit:
     if (pkey != NULL)
         EVP_PKEY_free(pkey);
     return 0;
@@ -1342,7 +1343,7 @@ static int decrypt_stub(neverbleed_iobuf_t *buf)
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
     if (use_offload) {
         bssl_offload_decrypt(buf, pkey, src, srclen);
-        return 0;
+        goto Exit;
     }
 #endif
 
@@ -1354,6 +1355,7 @@ static int decrypt_stub(neverbleed_iobuf_t *buf)
 
     iobuf_dispose(buf);
     iobuf_push_bytes(buf, decryptbuf, decryptlen);
+Exit:
     RSA_free(rsa);
     EVP_PKEY_free(pkey);
     return 0;
