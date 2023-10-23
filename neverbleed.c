@@ -636,7 +636,7 @@ struct engine_request {
 #endif
 };
 
-static void bssl_offload_free_request(struct engine_request *req)
+static void offload_free_request(struct engine_request *req)
 {
 #ifdef OPENSSL_IS_BORINGSSL
     bssl_qat_async_finish_job(req->async_ctx);
@@ -1188,7 +1188,7 @@ static int bssl_offload_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const v
     return 1;
 
 Exit:
-    bssl_offload_free_request(req);
+    offload_free_request(req);
     return 0;
 }
 
@@ -1766,7 +1766,7 @@ static int offload_resume(struct engine_request *req)
     iobuf_push_bytes(req->buf, req->data.output, outlen);
 
     req->buf->processing = 0;
-    bssl_offload_free_request(req);
+    offload_free_request(req);
 
     return 0;
 }
@@ -1809,7 +1809,7 @@ static int offload_start(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *
         break;
     }
 
-    bssl_offload_free_request(req);
+    offload_free_request(req);
 
     return ret;
 }
@@ -1833,7 +1833,7 @@ static int offload_resume(struct engine_request *req)
 
     /* job done */
     req->buf->processing = 0;
-    bssl_offload_free_request(req);
+    offload_free_request(req);
 
     return ret;
 }
