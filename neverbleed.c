@@ -1175,7 +1175,7 @@ static int bssl_offload_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const v
     if (meth == NULL)
         dief("failed to obtain QAT RSA method table\n");
     size_t outlen;
-    if (!meth->decrypt(req->data.rsa, &outlen, req->data.output, len, src, len, RSA_NO_PADDING))
+    if (!meth->decrypt(req->data.rsa, &outlen, req->data.output, sizeof(req->data.output), src, len, RSA_NO_PADDING)) {
         warnf("RSA decrypt failure\n");
         goto Exit;
     }
