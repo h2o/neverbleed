@@ -640,6 +640,7 @@ static void free_req(struct engine_request *req)
 {
 #ifdef OPENSSL_IS_BORINGSSL
     bssl_qat_async_finish_job(req->async_ctx);
+    RSA_free(req->data.rsa);
 #else
     ASYNC_WAIT_CTX_free(req->async.ctx);
 #endif
@@ -1763,8 +1764,6 @@ static int offload_resume(struct engine_request *req)
     /* save the result */
     iobuf_dispose(req->buf);
     iobuf_push_bytes(req->buf, req->data.output, outlen);
-    /* cleanup */
-    RSA_free(req->data.rsa);
 
     req->buf->processing = 0;
     free_req(req);
