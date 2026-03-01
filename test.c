@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/opensslconf.h>
 #include <openssl/opensslv.h>
 
@@ -69,7 +70,7 @@ int dumb_https_server(unsigned short port, SSL_CTX *ctx)
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse_flag, sizeof(reuse_flag));
     sin.sin_family = AF_INET;
     sin.sin_addr.s_addr = htonl(0x7f000001);
-    sin.sin_port = htons(8888);
+    sin.sin_port = htons(port);
     if (bind(listen_fd, (void *)&sin, sizeof(sin)) != 0) {
         fprintf(stderr, "bind failed:%s\n", strerror(errno));
         return 111;
