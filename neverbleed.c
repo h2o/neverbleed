@@ -1265,7 +1265,7 @@ Respond: /* build response */
     iobuf_push_bytes(buf, digestbuf, digestlen);
     if (mdctx != NULL)
         EVP_MD_CTX_destroy(mdctx);
-Exit:
+Exit: __attribute__((unused))
     if (pkey != NULL)
         EVP_PKEY_free(pkey);
     return 0;
@@ -1366,7 +1366,7 @@ static int decrypt_stub(neverbleed_iobuf_t *buf)
 Respond:
     iobuf_dispose(buf);
     iobuf_push_bytes(buf, decryptbuf, decryptlen);
-Exit:
+Exit: __attribute__((unused))
     RSA_free(rsa);
     EVP_PKEY_free(pkey);
     return 0;
