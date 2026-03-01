@@ -13,7 +13,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LIBS) $(LDFLAGS)
 
 check: $(TARGET)
-	t/test_handshake.sh
+	prove -v t/test_handshake.t
 
 clean:
 	rm -fr $(OBJS) $(TARGET)
