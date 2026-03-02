@@ -30,10 +30,10 @@ sub spawn_server {
     });
 }
 
-subtest "handshake" => sub {
-    my $guard = spawn_server();
-    
-    open my $fh, "-|", "printf 'GET / HTTP/1.0\\r\\n\\r\\n' | openssl s_client -connect 127.0.0.1:$port -CAfile $crt -verify_return_error -ign_eof 2>&1"
+sub doit {
+    my $args = shift;
+
+    open my $fh, "-|", "printf 'GET / HTTP/1.0\\r\\n\\r\\n' | openssl s_client $args -connect 127.0.0.1:$port -CAfile $crt -verify_return_error -ign_eof 2>&1"
         or die "failed to start s_client:$!";
     my $content = do { local $/; <$fh> };
     close $fh;
@@ -42,5 +42,17 @@ subtest "handshake" => sub {
     like($content, qr/HTTP\/1\.0 200 OK/, "HTTP 200 response received");
     like($content, qr/hello/, "Response contains expected content");
 };
+
+my $guard = spawn_server();
+
+subtest "sign" => sub {
+    doit("");
+};
+
+subtest "decrypt" => sub {
+    doit("-no_tls1_3 -cipher AES128-SHA");
+};
+
+undef $guard;
 
 done_testing;
