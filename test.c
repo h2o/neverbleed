@@ -46,9 +46,10 @@
 
 #include "neverbleed.h"
 
+static neverbleed_t nb;
+
 #ifdef OPENSSL_IS_BORINGSSL
-static void setup_boringssl_key_method(SSL_CTX *ctx, neverbleed_t *nb);
-static neverbleed_t *nb_global = NULL;
+static void setup_boringssl_key_method(SSL_CTX *ctx);
 static int boringssl_get_pkey_index(void);
 static void boringssl_free_pkey_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp);
 #endif
@@ -92,13 +93,14 @@ static enum ssl_private_key_result_t boringssl_sign(SSL *ssl, uint8_t *out, size
     neverbleed_iobuf_t buf = {NULL};
     void *digest = NULL;
     size_t digestlen = 0;
-    EVP_PKEY *pkey = SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl), boringssl_get_pkey_index());
+    SSL_CTX *ctx = SSL_get_SSL_CTX(ssl);
+    EVP_PKEY *pkey = SSL_CTX_get_ex_data(ctx, boringssl_get_pkey_index());
     const EVP_MD *md = SSL_get_signature_algorithm_digest(signature_algorithm);
     int rsa_pss = SSL_is_signature_algorithm_rsa_pss(signature_algorithm);
 
     neverbleed_start_digestsign(&buf, pkey, md, in, len, rsa_pss);
-    neverbleed_transaction_write(nb_global, &buf);
-    neverbleed_transaction_read(nb_global, &buf);
+    neverbleed_transaction_write(&nb, &buf);
+    neverbleed_transaction_read(&nb, &buf);
     neverbleed_finish_digestsign(&buf, &digest, &digestlen);
 
     assert(digestlen <= max_out);
@@ -115,11 +117,12 @@ static enum ssl_private_key_result_t boringssl_decrypt(SSL *ssl, uint8_t *out, s
     neverbleed_iobuf_t buf = {NULL};
     void *digest = NULL;
     size_t digestlen = 0;
-    EVP_PKEY *pkey = SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl), boringssl_get_pkey_index());
+    SSL_CTX *ctx = SSL_get_SSL_CTX(ssl);
+    EVP_PKEY *pkey = SSL_CTX_get_ex_data(ctx, boringssl_get_pkey_index());
 
     neverbleed_start_decrypt(&buf, pkey, in, len);
-    neverbleed_transaction_write(nb_global, &buf);
-    neverbleed_transaction_read(nb_global, &buf);
+    neverbleed_transaction_write(&nb, &buf);
+    neverbleed_transaction_read(&nb, &buf);
     neverbleed_finish_decrypt(&buf, &digest, &digestlen);
 
     assert(digestlen <= max_out);
@@ -130,7 +133,7 @@ static enum ssl_private_key_result_t boringssl_decrypt(SSL *ssl, uint8_t *out, s
     return ssl_private_key_success;
 }
 
-static void setup_boringssl_key_method(SSL_CTX *ctx, neverbleed_t *nb)
+static void setup_boringssl_key_method(SSL_CTX *ctx)
 {
     EVP_PKEY *pkey = SSL_CTX_get0_privatekey(ctx);
     EVP_PKEY_up_ref(pkey);
@@ -197,7 +200,6 @@ int main(int argc, char **argv)
 {
     unsigned short port;
     SSL_CTX *ctx;
-    neverbleed_t nb;
     char errbuf[NEVERBLEED_ERRBUF_SIZE];
     int use_privsep;
 
@@ -243,8 +245,7 @@ int main(int argc, char **argv)
             return 111;
         }
 #ifdef OPENSSL_IS_BORINGSSL
-        nb_global = &nb;
-        setup_boringssl_key_method(ctx, &nb);
+        setup_boringssl_key_method(ctx);
 #endif
     } else {
         if (SSL_CTX_use_PrivateKey_file(ctx, argv[4], SSL_FILETYPE_PEM) != 1) {
