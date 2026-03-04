@@ -67,6 +67,10 @@
 #define NEVERBLEED_ECDSA
 #endif
 
+#if !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+#define NEVERBLEED_PROVIDER
+#endif
+
 #include <openssl/bn.h>
 #ifdef NEVERBLEED_ECDSA
 #include <openssl/ec.h>
@@ -74,6 +78,14 @@
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
+#ifdef NEVERBLEED_PROVIDER
+#include <openssl/core.h>
+#include <openssl/core_dispatch.h>
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+#include <openssl/param_build.h>
+#include <openssl/provider.h>
+#endif
 
 #ifdef __linux
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(LIBRESSL_VERSION_NUMBER) && !defined(OPENSSL_IS_BORINGSSL)
@@ -556,6 +568,7 @@ static void do_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
     free(exdata);
 }
 
+#if !defined(NEVERBLEED_PROVIDER)
 static int get_rsa_exdata_idx(void);
 static void rsa_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
 {
@@ -581,6 +594,7 @@ static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t *
     }
     *thdata = get_thread_data((*exdata)->nb);
 }
+#endif /* !NEVERBLEED_PROVIDER */
 
 static struct {
     struct {
@@ -750,6 +764,7 @@ static size_t daemon_set_pkey(EVP_PKEY *pkey)
     return index;
 }
 
+#if !defined(NEVERBLEED_PROVIDER)
 static int priv_encdec_proxy(const char *cmd, int flen, const unsigned char *from, unsigned char *_to, RSA *rsa, int padding)
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
@@ -777,6 +792,7 @@ static int priv_encdec_proxy(const char *cmd, int flen, const unsigned char *fro
 
     return (int)ret;
 }
+#endif /* !NEVERBLEED_PROVIDER */
 
 static int priv_encdec_stub(const char *name,
                             int (*func)(int flen, const unsigned char *from, unsigned char *to, RSA *rsa, int padding),
@@ -811,26 +827,31 @@ static int priv_encdec_stub(const char *name,
 
 #if !defined(OPENSSL_IS_BORINGSSL)
 
+#if !defined(NEVERBLEED_PROVIDER)
 static int priv_enc_proxy(int flen, const unsigned char *from, unsigned char *to, RSA *rsa, int padding)
 {
     return priv_encdec_proxy("priv_enc", flen, from, to, rsa, padding);
 }
+#endif
 
 static int priv_enc_stub(neverbleed_iobuf_t *buf)
 {
     return priv_encdec_stub(__FUNCTION__, RSA_private_encrypt, buf);
 }
 
+#if !defined(NEVERBLEED_PROVIDER)
 static int priv_dec_proxy(int flen, const unsigned char *from, unsigned char *to, RSA *rsa, int padding)
 {
     return priv_encdec_proxy("priv_dec", flen, from, to, rsa, padding);
 }
+#endif
 
 static int priv_dec_stub(neverbleed_iobuf_t *buf)
 {
     return priv_encdec_stub(__FUNCTION__, RSA_private_decrypt, buf);
 }
 
+#if !defined(NEVERBLEED_PROVIDER)
 static int sign_proxy(int type, const unsigned char *m, unsigned int m_len, unsigned char *_sigret, unsigned *_siglen,
                       const RSA *rsa)
 {
@@ -858,6 +879,7 @@ static int sign_proxy(int type, const unsigned char *m, unsigned int m_len, unsi
 
     return (int)ret;
 }
+#endif
 
 static int sign_stub(neverbleed_iobuf_t *buf)
 {
@@ -887,10 +909,801 @@ static int sign_stub(neverbleed_iobuf_t *buf)
     return 0;
 }
 
-#endif
+#endif /* !OPENSSL_IS_BORINGSSL */
+
+#ifdef NEVERBLEED_PROVIDER
+
+/* ======================== OpenSSL 3 Provider ======================== */
+
+#define NEVERBLEED_PARAM_KEY_INDEX "neverbleed-key-index"
+
+static neverbleed_t *nb_provider_global_nb;
+
+struct nb_provider_ctx {
+    neverbleed_t *nb;
+};
+
+struct nb_rsa_keydata {
+    neverbleed_t *nb;
+    size_t key_index;
+    BIGNUM *n, *e;
+    int has_private;
+};
+
+struct nb_sig_ctx {
+    struct nb_provider_ctx *provctx;
+    struct nb_rsa_keydata *keydata;
+    unsigned char *tbsdata;
+    size_t tbslen, tbscap;
+    int md_nid;
+    int padding;
+    int pss_saltlen;
+};
+
+struct nb_asym_cipher_ctx {
+    struct nb_provider_ctx *provctx;
+    struct nb_rsa_keydata *keydata;
+    int padding;
+    unsigned int tls_client_version;
+    unsigned int tls_negotiated_version;
+};
+
+/* --- constant-time helpers for TLS padding check (all return 0 or 0xFFFFFFFF masks) --- */
+
+static inline unsigned int ct_is_zero_mask(unsigned int x)
+{
+    /* returns 0xFFFFFFFF if x == 0, 0 otherwise */
+    return 0u - (1u ^ ((x | (0u - x)) >> (sizeof(unsigned int) * 8 - 1)));
+}
+
+static inline unsigned int ct_eq_mask(unsigned int a, unsigned int b)
+{
+    return ct_is_zero_mask(a ^ b);
+}
+
+static inline unsigned char ct_select_8(unsigned int mask, unsigned char a, unsigned char b)
+{
+    return (unsigned char)((mask & a) | (~mask & b));
+}
+
+static inline unsigned int ct_ge_mask(unsigned int a, unsigned int b)
+{
+    /* returns 0xFFFFFFFF if a >= b, 0 otherwise (a, b must be < 2^31) */
+    return 0u - (1u & ~((a - b) >> (sizeof(unsigned int) * 8 - 1)));
+}
+
+/* --- KEYMGMT --- */
+
+static void *nb_keymgmt_new(void *provctx)
+{
+    struct nb_rsa_keydata *key = OPENSSL_zalloc(sizeof(*key));
+    if (key == NULL)
+        return NULL;
+    key->nb = ((struct nb_provider_ctx *)provctx)->nb;
+    key->key_index = SIZE_MAX;
+    return key;
+}
+
+static void nb_keymgmt_free(void *keydata)
+{
+    struct nb_rsa_keydata *key = keydata;
+    if (key == NULL)
+        return;
+    if (key->key_index != SIZE_MAX && key->has_private) {
+        struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
+        neverbleed_iobuf_t buf = {NULL};
+        iobuf_push_str(&buf, "del_pkey");
+        iobuf_push_num(&buf, key->key_index);
+        iobuf_transaction_no_response(&buf, thdata);
+    }
+    BN_free(key->n);
+    BN_free(key->e);
+    OPENSSL_free(key);
+}
+
+static int nb_keymgmt_has(const void *keydata, int selection)
+{
+    const struct nb_rsa_keydata *key = keydata;
+    if (key == NULL)
+        return 0;
+    if ((selection & OSSL_KEYMGMT_SELECT_PUBLIC_KEY) != 0 && (key->n == NULL || key->e == NULL))
+        return 0;
+    if ((selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) != 0 && !key->has_private)
+        return 0;
+    return 1;
+}
+
+static int nb_keymgmt_import(void *keydata, int selection, const OSSL_PARAM params[])
+{
+    struct nb_rsa_keydata *key = keydata;
+    const OSSL_PARAM *p;
+
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_RSA_N)) != NULL) {
+        BN_free(key->n);
+        key->n = NULL;
+        if (!OSSL_PARAM_get_BN(p, &key->n))
+            return 0;
+    }
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_RSA_E)) != NULL) {
+        BN_free(key->e);
+        key->e = NULL;
+        if (!OSSL_PARAM_get_BN(p, &key->e))
+            return 0;
+    }
+    if ((p = OSSL_PARAM_locate_const(params, NEVERBLEED_PARAM_KEY_INDEX)) != NULL) {
+        if (!OSSL_PARAM_get_size_t(p, &key->key_index))
+            return 0;
+        key->has_private = 1;
+    }
+    return 1;
+}
+
+static const OSSL_PARAM *nb_keymgmt_import_types(int selection)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_BN(OSSL_PKEY_PARAM_RSA_N, NULL, 0),
+        OSSL_PARAM_BN(OSSL_PKEY_PARAM_RSA_E, NULL, 0),
+        OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, NULL),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static int nb_keymgmt_get_params(void *keydata, OSSL_PARAM params[])
+{
+    struct nb_rsa_keydata *key = keydata;
+    OSSL_PARAM *p;
+
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_BITS)) != NULL) {
+        if (!OSSL_PARAM_set_int(p, key->n ? BN_num_bits(key->n) : 0))
+            return 0;
+    }
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_SECURITY_BITS)) != NULL) {
+        int bits = key->n ? BN_num_bits(key->n) : 0;
+        int sec_bits = bits >= 3072 ? 128 : (bits >= 2048 ? 112 : (bits >= 1024 ? 80 : 0));
+        if (!OSSL_PARAM_set_int(p, sec_bits))
+            return 0;
+    }
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_MAX_SIZE)) != NULL) {
+        if (!OSSL_PARAM_set_int(p, key->n ? BN_num_bytes(key->n) : 0))
+            return 0;
+    }
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_RSA_N)) != NULL) {
+        if (!OSSL_PARAM_set_BN(p, key->n))
+            return 0;
+    }
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_RSA_E)) != NULL) {
+        if (!OSSL_PARAM_set_BN(p, key->e))
+            return 0;
+    }
+    if ((p = OSSL_PARAM_locate(params, NEVERBLEED_PARAM_KEY_INDEX)) != NULL) {
+        if (!OSSL_PARAM_set_size_t(p, key->key_index))
+            return 0;
+    }
+    return 1;
+}
+
+static const OSSL_PARAM *nb_keymgmt_gettable_params(void *provctx)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_int(OSSL_PKEY_PARAM_BITS, NULL),
+        OSSL_PARAM_int(OSSL_PKEY_PARAM_SECURITY_BITS, NULL),
+        OSSL_PARAM_int(OSSL_PKEY_PARAM_MAX_SIZE, NULL),
+        OSSL_PARAM_BN(OSSL_PKEY_PARAM_RSA_N, NULL, 0),
+        OSSL_PARAM_BN(OSSL_PKEY_PARAM_RSA_E, NULL, 0),
+        OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, NULL),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static int nb_keymgmt_export(void *keydata, int selection, OSSL_CALLBACK *param_cb, void *cbarg)
+{
+    struct nb_rsa_keydata *key = keydata;
+    OSSL_PARAM_BLD *bld;
+    OSSL_PARAM *params;
+    int ret;
+
+    if ((selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) != 0)
+        return 0;
+    if (key->n == NULL || key->e == NULL)
+        return 0;
+
+    if ((bld = OSSL_PARAM_BLD_new()) == NULL)
+        return 0;
+    OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, key->n);
+    OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, key->e);
+    params = OSSL_PARAM_BLD_to_param(bld);
+    ret = param_cb(params, cbarg);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    return ret;
+}
+
+static const OSSL_PARAM *nb_keymgmt_export_types(int selection)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_BN(OSSL_PKEY_PARAM_RSA_N, NULL, 0),
+        OSSL_PARAM_BN(OSSL_PKEY_PARAM_RSA_E, NULL, 0),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static const OSSL_DISPATCH nb_keymgmt_functions[] = {
+    {OSSL_FUNC_KEYMGMT_NEW, (void (*)(void))nb_keymgmt_new},
+    {OSSL_FUNC_KEYMGMT_FREE, (void (*)(void))nb_keymgmt_free},
+    {OSSL_FUNC_KEYMGMT_HAS, (void (*)(void))nb_keymgmt_has},
+    {OSSL_FUNC_KEYMGMT_IMPORT, (void (*)(void))nb_keymgmt_import},
+    {OSSL_FUNC_KEYMGMT_IMPORT_TYPES, (void (*)(void))nb_keymgmt_import_types},
+    {OSSL_FUNC_KEYMGMT_GET_PARAMS, (void (*)(void))nb_keymgmt_get_params},
+    {OSSL_FUNC_KEYMGMT_GETTABLE_PARAMS, (void (*)(void))nb_keymgmt_gettable_params},
+    {OSSL_FUNC_KEYMGMT_EXPORT, (void (*)(void))nb_keymgmt_export},
+    {OSSL_FUNC_KEYMGMT_EXPORT_TYPES, (void (*)(void))nb_keymgmt_export_types},
+    {0, NULL},
+};
+
+/* --- SIGNATURE --- */
+
+static void *nb_sig_newctx(void *provctx, const char *propq)
+{
+    struct nb_sig_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
+    if (ctx == NULL)
+        return NULL;
+    ctx->provctx = provctx;
+    ctx->padding = RSA_PKCS1_PADDING;
+    ctx->pss_saltlen = -1;
+    ctx->md_nid = NID_undef;
+    return ctx;
+}
+
+static void nb_sig_freectx(void *vctx)
+{
+    struct nb_sig_ctx *ctx = vctx;
+    if (ctx == NULL)
+        return;
+    OPENSSL_free(ctx->tbsdata);
+    OPENSSL_free(ctx);
+}
+
+static int nb_sig_sign_init(void *vctx, void *vkey, const OSSL_PARAM params[])
+{
+    struct nb_sig_ctx *ctx = vctx;
+    ctx->keydata = vkey;
+    return 1;
+}
+
+static int nb_sig_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs, size_t tbslen)
+{
+    struct nb_sig_ctx *ctx = vctx;
+    struct nb_rsa_keydata *key = ctx->keydata;
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
+    neverbleed_iobuf_t buf = {NULL};
+    size_t ret;
+    unsigned char *sigret;
+    size_t retlen;
+
+    if (sig == NULL) {
+        *siglen = key->n ? BN_num_bytes(key->n) : 0;
+        return 1;
+    }
+
+    iobuf_push_str(&buf, "sign");
+    iobuf_push_num(&buf, ctx->md_nid != NID_undef ? ctx->md_nid : NID_md5_sha1);
+    iobuf_push_bytes(&buf, tbs, tbslen);
+    iobuf_push_num(&buf, key->key_index);
+    iobuf_transaction(&buf, thdata);
+
+    if (iobuf_shift_num(&buf, &ret) != 0 || (sigret = iobuf_shift_bytes(&buf, &retlen)) == NULL) {
+        iobuf_dispose(&buf);
+        return 0;
+    }
+    if (ret != 1 || retlen > sigsize) {
+        iobuf_dispose(&buf);
+        return 0;
+    }
+    memcpy(sig, sigret, retlen);
+    *siglen = retlen;
+    iobuf_dispose(&buf);
+    return 1;
+}
+
+static int nb_sig_digest_sign_init(void *vctx, const char *mdname, void *vkey, const OSSL_PARAM params[])
+{
+    struct nb_sig_ctx *ctx = vctx;
+    ctx->keydata = vkey;
+    if (mdname != NULL) {
+        const EVP_MD *md = EVP_get_digestbyname(mdname);
+        ctx->md_nid = md ? EVP_MD_type(md) : NID_undef;
+    }
+    ctx->tbslen = 0;
+    return 1;
+}
+
+static int nb_sig_digest_sign_update(void *vctx, const unsigned char *data, size_t datalen)
+{
+    struct nb_sig_ctx *ctx = vctx;
+    if (ctx->tbslen + datalen > ctx->tbscap) {
+        ctx->tbscap = ctx->tbslen + datalen + 256;
+        ctx->tbsdata = OPENSSL_realloc(ctx->tbsdata, ctx->tbscap);
+        if (ctx->tbsdata == NULL)
+            return 0;
+    }
+    memcpy(ctx->tbsdata + ctx->tbslen, data, datalen);
+    ctx->tbslen += datalen;
+    return 1;
+}
+
+static int nb_sig_digest_sign_final(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize)
+{
+    struct nb_sig_ctx *ctx = vctx;
+    struct nb_rsa_keydata *key = ctx->keydata;
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
+    neverbleed_iobuf_t buf = {NULL};
+    size_t retlen;
+    unsigned char *sigret;
+
+    if (sig == NULL) {
+        *siglen = key->n ? BN_num_bytes(key->n) : 0;
+        return 1;
+    }
+
+    iobuf_push_str(&buf, "digestsign-rsa");
+    iobuf_push_num(&buf, key->key_index);
+    iobuf_push_num(&buf, ctx->md_nid != NID_undef ? (size_t)ctx->md_nid : SIZE_MAX);
+    iobuf_push_bytes(&buf, ctx->tbsdata, ctx->tbslen);
+    iobuf_push_num(&buf, ctx->padding == RSA_PKCS1_PSS_PADDING ? 1 : 0);
+    iobuf_transaction(&buf, thdata);
+
+    if ((sigret = iobuf_shift_bytes(&buf, &retlen)) == NULL) {
+        iobuf_dispose(&buf);
+        return 0;
+    }
+    if (retlen == 0 || retlen > sigsize) {
+        iobuf_dispose(&buf);
+        return 0;
+    }
+    memcpy(sig, sigret, retlen);
+    *siglen = retlen;
+    iobuf_dispose(&buf);
+    return 1;
+}
+
+static int nb_sig_digest_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs,
+                              size_t tbslen)
+{
+    struct nb_sig_ctx *ctx = vctx;
+
+    /* If called for size query, just return max size */
+    if (sig == NULL) {
+        struct nb_rsa_keydata *key = ctx->keydata;
+        *siglen = key->n ? BN_num_bytes(key->n) : 0;
+        return 1;
+    }
+
+    /* Buffer the data and call final */
+    ctx->tbslen = 0;
+    if (!nb_sig_digest_sign_update(vctx, tbs, tbslen))
+        return 0;
+    return nb_sig_digest_sign_final(vctx, sig, siglen, sigsize);
+}
+
+static int nb_sig_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+{
+    struct nb_sig_ctx *ctx = vctx;
+    const OSSL_PARAM *p;
+
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_PAD_MODE)) != NULL) {
+        if (p->data_type == OSSL_PARAM_INTEGER) {
+            OSSL_PARAM_get_int(p, &ctx->padding);
+        } else if (p->data_type == OSSL_PARAM_UTF8_STRING) {
+            if (strcmp(p->data, "pss") == 0)
+                ctx->padding = RSA_PKCS1_PSS_PADDING;
+            else if (strcmp(p->data, "pkcs1") == 0)
+                ctx->padding = RSA_PKCS1_PADDING;
+        }
+    }
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_DIGEST)) != NULL) {
+        char mdname[64] = "";
+        OSSL_PARAM_get_utf8_string(p, (char **)&(char *){mdname}, sizeof(mdname));
+        const EVP_MD *md = EVP_get_digestbyname(mdname);
+        if (md != NULL)
+            ctx->md_nid = EVP_MD_type(md);
+    }
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_PSS_SALTLEN)) != NULL) {
+        if (p->data_type == OSSL_PARAM_INTEGER)
+            OSSL_PARAM_get_int(p, &ctx->pss_saltlen);
+    }
+    return 1;
+}
+
+static const OSSL_PARAM *nb_sig_settable_ctx_params(void *vctx, void *provctx)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_PAD_MODE, NULL, 0),
+        OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_DIGEST, NULL, 0),
+        OSSL_PARAM_int(OSSL_SIGNATURE_PARAM_PSS_SALTLEN, NULL),
+        OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_MGF1_DIGEST, NULL, 0),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static int nb_sig_get_ctx_params(void *vctx, OSSL_PARAM params[])
+{
+    struct nb_sig_ctx *ctx = vctx;
+    OSSL_PARAM *p;
+
+    if ((p = OSSL_PARAM_locate(params, OSSL_SIGNATURE_PARAM_PAD_MODE)) != NULL) {
+        if (!OSSL_PARAM_set_int(p, ctx->padding))
+            return 0;
+    }
+    if ((p = OSSL_PARAM_locate(params, OSSL_SIGNATURE_PARAM_DIGEST)) != NULL) {
+        const char *name = ctx->md_nid != NID_undef ? OBJ_nid2sn(ctx->md_nid) : "";
+        if (!OSSL_PARAM_set_utf8_string(p, name))
+            return 0;
+    }
+    /* OSSL_SIGNATURE_PARAM_ALGORITHM_ID not handled; OpenSSL computes it at a higher level */
+    return 1;
+}
+
+static const OSSL_PARAM *nb_sig_gettable_ctx_params(void *vctx, void *provctx)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_int(OSSL_SIGNATURE_PARAM_PAD_MODE, NULL),
+        OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_DIGEST, NULL, 0),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static const OSSL_DISPATCH nb_sig_functions[] = {
+    {OSSL_FUNC_SIGNATURE_NEWCTX, (void (*)(void))nb_sig_newctx},
+    {OSSL_FUNC_SIGNATURE_FREECTX, (void (*)(void))nb_sig_freectx},
+    {OSSL_FUNC_SIGNATURE_SIGN_INIT, (void (*)(void))nb_sig_sign_init},
+    {OSSL_FUNC_SIGNATURE_SIGN, (void (*)(void))nb_sig_sign},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT, (void (*)(void))nb_sig_digest_sign_init},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE, (void (*)(void))nb_sig_digest_sign_update},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_FINAL, (void (*)(void))nb_sig_digest_sign_final},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN, (void (*)(void))nb_sig_digest_sign},
+    {OSSL_FUNC_SIGNATURE_SET_CTX_PARAMS, (void (*)(void))nb_sig_set_ctx_params},
+    {OSSL_FUNC_SIGNATURE_SETTABLE_CTX_PARAMS, (void (*)(void))nb_sig_settable_ctx_params},
+    {OSSL_FUNC_SIGNATURE_GET_CTX_PARAMS, (void (*)(void))nb_sig_get_ctx_params},
+    {OSSL_FUNC_SIGNATURE_GETTABLE_CTX_PARAMS, (void (*)(void))nb_sig_gettable_ctx_params},
+    {0, NULL},
+};
+
+/* --- ASYM_CIPHER --- */
+
+static void *nb_asym_cipher_newctx(void *provctx)
+{
+    struct nb_asym_cipher_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
+    if (ctx == NULL)
+        return NULL;
+    ctx->provctx = provctx;
+    ctx->padding = RSA_PKCS1_PADDING;
+    return ctx;
+}
+
+static void nb_asym_cipher_freectx(void *vctx)
+{
+    OPENSSL_free(vctx);
+}
+
+static int nb_asym_cipher_decrypt_init(void *vctx, void *vkey, const OSSL_PARAM params[])
+{
+    struct nb_asym_cipher_ctx *ctx = vctx;
+    ctx->keydata = vkey;
+    return 1;
+}
+
+static int nb_asym_cipher_decrypt(void *vctx, unsigned char *out, size_t *outlen, size_t outsize, const unsigned char *in,
+                                  size_t inlen)
+{
+    struct nb_asym_cipher_ctx *ctx = vctx;
+    struct nb_rsa_keydata *key = ctx->keydata;
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
+    int rsa_size = key->n ? BN_num_bytes(key->n) : 0;
+
+    if (out == NULL) {
+        *outlen = rsa_size;
+        return 1;
+    }
+
+    if (ctx->padding == RSA_NO_PADDING) {
+        /* raw decrypt via daemon */
+        neverbleed_iobuf_t buf = {NULL};
+        iobuf_push_str(&buf, "decrypt");
+        iobuf_push_num(&buf, key->key_index);
+        iobuf_push_bytes(&buf, in, inlen);
+        iobuf_transaction(&buf, thdata);
+
+        size_t declen;
+        unsigned char *dec;
+        if ((dec = iobuf_shift_bytes(&buf, &declen)) == NULL || declen == 0) {
+            iobuf_dispose(&buf);
+            return 0;
+        }
+        if (declen > outsize) {
+            iobuf_dispose(&buf);
+            return 0;
+        }
+        memcpy(out, dec, declen);
+        *outlen = declen;
+        iobuf_dispose(&buf);
+        return 1;
+    } else if (ctx->padding == RSA_PKCS1_PADDING) {
+        /* PKCS1 decrypt via daemon priv_dec */
+        neverbleed_iobuf_t buf = {NULL};
+        iobuf_push_str(&buf, "priv_dec");
+        iobuf_push_bytes(&buf, in, inlen);
+        iobuf_push_num(&buf, key->key_index);
+        iobuf_push_num(&buf, (size_t)RSA_PKCS1_PADDING);
+        iobuf_transaction(&buf, thdata);
+
+        size_t ret;
+        unsigned char *dec;
+        size_t declen;
+        if (iobuf_shift_num(&buf, &ret) != 0 || (dec = iobuf_shift_bytes(&buf, &declen)) == NULL) {
+            iobuf_dispose(&buf);
+            return 0;
+        }
+        if ((int)ret <= 0) {
+            iobuf_dispose(&buf);
+            return 0;
+        }
+        if (declen > outsize) {
+            iobuf_dispose(&buf);
+            return 0;
+        }
+        memcpy(out, dec, declen);
+        *outlen = declen;
+        iobuf_dispose(&buf);
+        return 1;
+    } else if (ctx->padding == RSA_PKCS1_WITH_TLS_PADDING) {
+        /* Raw decrypt then constant-time PKCS1 type 2 TLS unpadding */
+        neverbleed_iobuf_t buf = {NULL};
+        iobuf_push_str(&buf, "decrypt");
+        iobuf_push_num(&buf, key->key_index);
+        iobuf_push_bytes(&buf, in, inlen);
+        iobuf_transaction(&buf, thdata);
+
+        size_t declen;
+        unsigned char *dec;
+        if ((dec = iobuf_shift_bytes(&buf, &declen)) == NULL || declen == 0) {
+            iobuf_dispose(&buf);
+            /* Even on failure, return random PMS for Bleichenbacher countermeasure */
+            unsigned char rand_pms[SSL_MAX_MASTER_KEY_LENGTH];
+            RAND_bytes(rand_pms, sizeof(rand_pms));
+            if (sizeof(rand_pms) > outsize)
+                return 0;
+            memcpy(out, rand_pms, sizeof(rand_pms));
+            *outlen = sizeof(rand_pms);
+            return 1;
+        }
+
+        /* Constant-time PKCS1 type 2 TLS check */
+        unsigned char rand_pms[SSL_MAX_MASTER_KEY_LENGTH];
+        RAND_bytes(rand_pms, sizeof(rand_pms));
+
+        /* Check 0x00 0x02 header */
+        unsigned int good = ct_eq_mask(dec[0], 0) & ct_eq_mask(dec[1], 2);
+
+        /* Find 0x00 separator, require at least 8 bytes of padding */
+        size_t sep_idx = 0;
+        unsigned int found_sep = 0;
+        for (size_t i = 2; i < declen; i++) {
+            unsigned int is_zero = ct_eq_mask(dec[i], 0);
+            unsigned int is_first = is_zero & ~found_sep & ct_ge_mask((unsigned int)i, 10u);
+            /* ct_ge_mask(i, 10u) means i >= 10, i.e., at least 8 bytes of padding (indices 2..9) */
+            sep_idx |= is_first & (unsigned int)i;
+            found_sep |= is_first;
+        }
+        good &= found_sep;
+
+        /* PMS starts at sep_idx + 1, length should be 48 */
+        size_t pms_start = sep_idx + 1;
+        size_t pms_len = declen - pms_start;
+        good &= ct_eq_mask((unsigned int)pms_len, SSL_MAX_MASTER_KEY_LENGTH);
+
+        /* Check TLS version in first two bytes of PMS */
+        if (ctx->tls_client_version != 0) {
+            unsigned int ver_hi = ctx->tls_client_version >> 8;
+            unsigned int ver_lo = ctx->tls_client_version & 0xff;
+            /* Only check if pms_start is valid */
+            unsigned int check_ver = good;
+            if (pms_start + 1 < declen) {
+                check_ver &= ct_eq_mask(dec[pms_start], ver_hi) & ct_eq_mask(dec[pms_start + 1], ver_lo);
+            } else {
+                check_ver = 0;
+            }
+            good = check_ver;
+        }
+
+        /* Constant-time select between real PMS and random PMS */
+        unsigned char result[SSL_MAX_MASTER_KEY_LENGTH];
+        for (size_t i = 0; i < SSL_MAX_MASTER_KEY_LENGTH; i++) {
+            size_t src_idx = pms_start + i;
+            unsigned char real_byte = (src_idx < declen) ? dec[src_idx] : 0;
+            result[i] = ct_select_8(good, real_byte, rand_pms[i]);
+        }
+
+        iobuf_dispose(&buf);
+
+        if (SSL_MAX_MASTER_KEY_LENGTH > outsize)
+            return 0;
+        memcpy(out, result, SSL_MAX_MASTER_KEY_LENGTH);
+        *outlen = SSL_MAX_MASTER_KEY_LENGTH;
+        /* Always return success (Bleichenbacher countermeasure) */
+        return 1;
+    }
+
+    return 0;
+}
+
+static int nb_asym_cipher_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+{
+    struct nb_asym_cipher_ctx *ctx = vctx;
+    const OSSL_PARAM *p;
+
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_ASYM_CIPHER_PARAM_PAD_MODE)) != NULL) {
+        if (p->data_type == OSSL_PARAM_INTEGER)
+            OSSL_PARAM_get_int(p, &ctx->padding);
+        else if (p->data_type == OSSL_PARAM_UTF8_STRING) {
+            if (strcmp(p->data, "oaep") == 0)
+                ctx->padding = RSA_PKCS1_OAEP_PADDING;
+            else if (strcmp(p->data, "pkcs1") == 0)
+                ctx->padding = RSA_PKCS1_PADDING;
+            else if (strcmp(p->data, "none") == 0)
+                ctx->padding = RSA_NO_PADDING;
+        }
+    }
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_ASYM_CIPHER_PARAM_TLS_CLIENT_VERSION)) != NULL)
+        OSSL_PARAM_get_uint(p, &ctx->tls_client_version);
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_ASYM_CIPHER_PARAM_TLS_NEGOTIATED_VERSION)) != NULL)
+        OSSL_PARAM_get_uint(p, &ctx->tls_negotiated_version);
+    return 1;
+}
+
+static const OSSL_PARAM *nb_asym_cipher_settable_ctx_params(void *vctx, void *provctx)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_utf8_string(OSSL_ASYM_CIPHER_PARAM_PAD_MODE, NULL, 0),
+        OSSL_PARAM_uint(OSSL_ASYM_CIPHER_PARAM_TLS_CLIENT_VERSION, NULL),
+        OSSL_PARAM_uint(OSSL_ASYM_CIPHER_PARAM_TLS_NEGOTIATED_VERSION, NULL),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static int nb_asym_cipher_get_ctx_params(void *vctx, OSSL_PARAM params[])
+{
+    struct nb_asym_cipher_ctx *ctx = vctx;
+    OSSL_PARAM *p;
+
+    if ((p = OSSL_PARAM_locate(params, OSSL_ASYM_CIPHER_PARAM_PAD_MODE)) != NULL) {
+        if (!OSSL_PARAM_set_int(p, ctx->padding))
+            return 0;
+    }
+    return 1;
+}
+
+static const OSSL_PARAM *nb_asym_cipher_gettable_ctx_params(void *vctx, void *provctx)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_int(OSSL_ASYM_CIPHER_PARAM_PAD_MODE, NULL),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static const OSSL_DISPATCH nb_asym_cipher_functions[] = {
+    {OSSL_FUNC_ASYM_CIPHER_NEWCTX, (void (*)(void))nb_asym_cipher_newctx},
+    {OSSL_FUNC_ASYM_CIPHER_FREECTX, (void (*)(void))nb_asym_cipher_freectx},
+    {OSSL_FUNC_ASYM_CIPHER_DECRYPT_INIT, (void (*)(void))nb_asym_cipher_decrypt_init},
+    {OSSL_FUNC_ASYM_CIPHER_DECRYPT, (void (*)(void))nb_asym_cipher_decrypt},
+    {OSSL_FUNC_ASYM_CIPHER_SET_CTX_PARAMS, (void (*)(void))nb_asym_cipher_set_ctx_params},
+    {OSSL_FUNC_ASYM_CIPHER_SETTABLE_CTX_PARAMS, (void (*)(void))nb_asym_cipher_settable_ctx_params},
+    {OSSL_FUNC_ASYM_CIPHER_GET_CTX_PARAMS, (void (*)(void))nb_asym_cipher_get_ctx_params},
+    {OSSL_FUNC_ASYM_CIPHER_GETTABLE_CTX_PARAMS, (void (*)(void))nb_asym_cipher_gettable_ctx_params},
+    {0, NULL},
+};
+
+/* --- Provider entry point --- */
+
+static const OSSL_ALGORITHM nb_keymgmts[] = {
+    {"RSA", "provider=neverbleed", nb_keymgmt_functions, "Neverbleed RSA KEYMGMT"},
+    {NULL, NULL, NULL, NULL},
+};
+
+static const OSSL_ALGORITHM nb_signatures[] = {
+    {"RSA", "provider=neverbleed", nb_sig_functions, "Neverbleed RSA Signature"},
+    {NULL, NULL, NULL, NULL},
+};
+
+static const OSSL_ALGORITHM nb_asym_ciphers[] = {
+    {"RSA", "provider=neverbleed", nb_asym_cipher_functions, "Neverbleed RSA Asymmetric Cipher"},
+    {NULL, NULL, NULL, NULL},
+};
+
+static const OSSL_ALGORITHM *nb_provider_query_operation(void *provctx, int operation_id, int *no_cache)
+{
+    *no_cache = 0;
+    switch (operation_id) {
+    case OSSL_OP_KEYMGMT:
+        return nb_keymgmts;
+    case OSSL_OP_SIGNATURE:
+        return nb_signatures;
+    case OSSL_OP_ASYM_CIPHER:
+        return nb_asym_ciphers;
+    }
+    return NULL;
+}
+
+static void nb_provider_teardown(void *provctx)
+{
+    OPENSSL_free(provctx);
+}
+
+static const OSSL_DISPATCH nb_provider_dispatch[] = {
+    {OSSL_FUNC_PROVIDER_TEARDOWN, (void (*)(void))nb_provider_teardown},
+    {OSSL_FUNC_PROVIDER_QUERY_OPERATION, (void (*)(void))nb_provider_query_operation},
+    {0, NULL},
+};
+
+static int nb_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in, const OSSL_DISPATCH **out, void **provctx)
+{
+    struct nb_provider_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
+    if (ctx == NULL)
+        return 0;
+    ctx->nb = nb_provider_global_nb;
+    *provctx = ctx;
+    *out = nb_provider_dispatch;
+    return 1;
+}
+
+#endif /* NEVERBLEED_PROVIDER */
 
 static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebuf, const char *nbuf)
 {
+#ifdef NEVERBLEED_PROVIDER
+    BIGNUM *e = NULL, *n = NULL;
+    EVP_PKEY *pkey = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    OSSL_PARAM *params = NULL;
+    EVP_PKEY_CTX *pctx = NULL;
+
+    if (BN_hex2bn(&e, ebuf) == 0) {
+        fprintf(stderr, "failed to parse e:%s\n", ebuf);
+        abort();
+    }
+    if (BN_hex2bn(&n, nbuf) == 0) {
+        fprintf(stderr, "failed to parse n:%s\n", nbuf);
+        abort();
+    }
+
+    if ((bld = OSSL_PARAM_BLD_new()) == NULL)
+        dief("no memory");
+    OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, n);
+    OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, e);
+    OSSL_PARAM_BLD_push_size_t(bld, NEVERBLEED_PARAM_KEY_INDEX, key_index);
+    if ((params = OSSL_PARAM_BLD_to_param(bld)) == NULL)
+        dief("OSSL_PARAM_BLD_to_param failed");
+
+    if ((pctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", "provider=neverbleed")) == NULL)
+        dief("EVP_PKEY_CTX_new_from_name failed");
+    if (EVP_PKEY_fromdata_init(pctx) <= 0)
+        dief("EVP_PKEY_fromdata_init failed");
+    if (EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEYPAIR, params) <= 0)
+        dief("EVP_PKEY_fromdata failed");
+
+    EVP_PKEY_CTX_free(pctx);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    BN_free(e);
+    BN_free(n);
+    return pkey;
+#else
     struct st_neverbleed_rsa_exdata_t *exdata;
     RSA *rsa;
     EVP_PKEY *pkey;
@@ -923,6 +1736,7 @@ static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebu
     RSA_free(rsa);
 
     return pkey;
+#endif /* NEVERBLEED_PROVIDER */
 }
 
 #ifdef NEVERBLEED_ECDSA
@@ -1278,31 +2092,49 @@ Softfail:
 void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const EVP_MD *md, const void *input, size_t len,
                                  int rsa_pss)
 {
-    struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
+    size_t key_index;
+    neverbleed_t *nb_ref;
     const char *cmd = "digestsign";
 
     /* obtain reference */
     switch (EVP_PKEY_base_id(pkey)) {
     case EVP_PKEY_RSA: {
-        RSA *rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
+#ifdef NEVERBLEED_PROVIDER
+        OSSL_PARAM get_params[] = {OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, &key_index), OSSL_PARAM_END};
+        if (!EVP_PKEY_get_params(pkey, get_params))
+            dief("failed to get key_index from provider key");
+        nb_ref = nb_provider_global_nb;
+#else
+        struct st_neverbleed_rsa_exdata_t *exdata;
+        struct st_neverbleed_thread_data_t *thdata;
+        RSA *rsa = EVP_PKEY_get1_RSA(pkey);
         get_privsep_data(rsa, &exdata, &thdata);
         RSA_free(rsa);
+        key_index = exdata->key_index;
+        nb_ref = exdata->nb;
+#endif
         cmd = "digestsign-rsa";
     } break;
 #ifdef NEVERBLEED_ECDSA
-    case EVP_PKEY_EC:
+    case EVP_PKEY_EC: {
+        struct st_neverbleed_rsa_exdata_t *exdata;
+        struct st_neverbleed_thread_data_t *thdata;
         ecdsa_get_privsep_data(EVP_PKEY_get0_EC_KEY(pkey), &exdata, &thdata);
-        break;
+        key_index = exdata->key_index;
+        nb_ref = exdata->nb;
+    } break;
 #endif
     default:
         dief("unexpected private key");
         break;
     }
 
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb_ref);
+    (void)thdata;
+
     *buf = (neverbleed_iobuf_t){NULL};
     iobuf_push_str(buf, cmd);
-    iobuf_push_num(buf, exdata->key_index);
+    iobuf_push_num(buf, key_index);
     iobuf_push_num(buf, md != NULL ? (size_t)EVP_MD_nid(md) : SIZE_MAX);
     iobuf_push_bytes(buf, input, len);
     iobuf_push_num(buf, rsa_pss);
@@ -1378,19 +2210,29 @@ Softfail:
 
 void neverbleed_start_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const void *input, size_t len)
 {
-    struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
+    size_t key_index;
 
+#ifdef NEVERBLEED_PROVIDER
     {
+        OSSL_PARAM get_params[] = {OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, &key_index), OSSL_PARAM_END};
+        if (!EVP_PKEY_get_params(pkey, get_params))
+            dief("failed to get key_index from provider key");
+    }
+#else
+    {
+        struct st_neverbleed_rsa_exdata_t *exdata;
+        struct st_neverbleed_thread_data_t *thdata;
         RSA *rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
         assert(rsa != NULL);
         get_privsep_data(rsa, &exdata, &thdata);
         RSA_free(rsa);
+        key_index = exdata->key_index;
     }
+#endif
 
     *buf = (neverbleed_iobuf_t){NULL};
     iobuf_push_str(buf, "decrypt");
-    iobuf_push_num(buf, exdata->key_index);
+    iobuf_push_num(buf, key_index);
     iobuf_push_bytes(buf, input, len);
 }
 
@@ -2108,7 +2950,7 @@ static void set_signal_handler(int signo, void (*cb)(int signo))
     sigaction(signo, &action, NULL);
 }
 
-#ifndef NEVERBLEED_OPAQUE_RSA_METHOD
+#if !defined(NEVERBLEED_OPAQUE_RSA_METHOD) && !defined(NEVERBLEED_PROVIDER)
 
 static RSA_METHOD static_rsa_method = {
     "privsep RSA method", /* name */
@@ -2197,7 +3039,35 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     pipe_fds[0] = -1;
 
 #if defined(OPENSSL_IS_BORINGSSL)
-    nb->engine = NULL;
+    /* no engine for BoringSSL */
+#elif defined(NEVERBLEED_PROVIDER)
+    { /* setup provider for RSA, engine for ECDSA only */
+        nb_provider_global_nb = nb;
+        if (!OSSL_PROVIDER_add_builtin(NULL, "neverbleed", nb_provider_init)) {
+            snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "OSSL_PROVIDER_add_builtin failed");
+            goto Fail;
+        }
+        nb->provider = OSSL_PROVIDER_load(NULL, "neverbleed");
+        if (nb->provider == NULL) {
+            snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "OSSL_PROVIDER_load failed");
+            goto Fail;
+        }
+#ifdef NEVERBLEED_ECDSA
+        { /* ECDSA-only ENGINE */
+            const EC_KEY_METHOD *ecdsa_default_method = EC_KEY_get_default_method();
+            EC_KEY_METHOD *ecdsa_method = EC_KEY_METHOD_new(ecdsa_default_method);
+            EC_KEY_METHOD_set_sign(ecdsa_method, ecdsa_sign_proxy, NULL, NULL);
+
+            if ((nb->engine = ENGINE_new()) == NULL || !ENGINE_set_id(nb->engine, "neverbleed") ||
+                !ENGINE_set_name(nb->engine, "privilege separation software engine") ||
+                !ENGINE_set_EC(nb->engine, ecdsa_method)) {
+                snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "failed to initialize the OpenSSL engine for ECDSA");
+                goto Fail;
+            }
+            ENGINE_add(nb->engine);
+        }
+#endif
+    }
 #else
     { /* setup engine */
         const RSA_METHOD *rsa_default_method;
@@ -2262,10 +3132,12 @@ Fail:
     }
     if (listen_fd != -1)
         close(listen_fd);
+#if !defined(OPENSSL_IS_BORINGSSL)
     if (nb->engine != NULL) {
         ENGINE_free(nb->engine);
         nb->engine = NULL;
     }
+#endif
     return -1;
 }
 
