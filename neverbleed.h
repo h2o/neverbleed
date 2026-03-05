@@ -33,14 +33,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#if (defined(__linux__) && !defined(__ANDROID__)) || defined(__FreeBSD__) || defined(__NetBSD__)
-#define NEVERBLEED_HAS_PTHREAD_SETAFFINITY_NP 1
-#if defined(__linux__)
-#define NEVERBLEED_CPU_SET_T cpu_set_t
-#else
-#define NEVERBLEED_CPU_SET_T cpuset_t
-#endif
-#endif
 
 #define NEVERBLEED_ERRBUF_SIZE (256)
 #define NEVERBLEED_AUTH_TOKEN_SIZE 32
@@ -62,10 +54,12 @@ typedef struct st_neverbleed_iobuf_t {
     unsigned processing : 1;
 } neverbleed_iobuf_t;
 
+#define NEVERBLEED_MAX_WORKER_THREADS 1024
+
 /**
  * initializes the privilege separation engine (returns 0 if successful)
  */
-int neverbleed_init(neverbleed_t *nb, char *errbuf);
+int neverbleed_init(neverbleed_t *nb, size_t worker_threads, size_t max_events, char *errbuf);
 /**
  * loads a private key file (returns 1 if successful)
  */
@@ -92,13 +86,6 @@ void neverbleed_start_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const voi
  * parses a decrypt response
  */
 void neverbleed_finish_decrypt(neverbleed_iobuf_t *buf, void **digest, size_t *digest_len);
-
-#if NEVERBLEED_HAS_PTHREAD_SETAFFINITY_NP
-/**
- * set the cpu affinity for the neverbleed thread (returns 0 if successful)
- */
-int neverbleed_setaffinity(neverbleed_t *nb, NEVERBLEED_CPU_SET_T *cpuset);
-#endif
 
 /**
  * an optional callback that can be registered by the application for doing stuff immediately after the neverbleed process is being

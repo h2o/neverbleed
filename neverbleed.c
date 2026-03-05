@@ -38,6 +38,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <signal.h>
+#include <poll.h>
 #if defined(__linux__)
 #include <sys/epoll.h>
 #include <sys/prctl.h>
@@ -596,24 +597,71 @@ static struct {
         size_t num_slots;
         size_t first_empty;
     } keys;
+    size_t max_events;
     neverbleed_t *nb;
-} daemon_vars = {{.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX}};
+} daemon_vars = {{.lock = PTHREAD_MUTEX_INITIALIZER, .first_empty = SIZE_MAX}, .max_events = 5};
 
-static __thread struct {
+struct st_nb_conn_ctx_t {
     int sockfd;
-#ifdef __linux
-    int epollfd;
-#endif
+    pthread_mutex_t lock;
     struct {
         neverbleed_iobuf_t *first, **next;
     } responses;
-} conn_ctx;
+    int ref_count;
+};
+
+int conn_ctx_up_ref(struct st_nb_conn_ctx_t *conn_ctx) {
+    return __sync_add_and_fetch(&conn_ctx->ref_count, 1);
+}
+
+void conn_ctx_down_ref(struct st_nb_conn_ctx_t *conn_ctx) {
+    if (__sync_add_and_fetch(&conn_ctx->ref_count, -1) == 0) {
+        close(conn_ctx->sockfd);
+        pthread_mutex_destroy(&conn_ctx->lock);
+        free(conn_ctx);
+    }
+}
+
+typedef enum enum_nb_epoll_type_t {
+    EPOLL_TYPE_UNUSED = 0,
+    EPOLL_TYPE_CONN,
+#if USE_OFFLOAD
+    EPOLL_TYPE_OFFLOAD,
+#endif
+} nb_epoll_type_t;
+
+struct st_nb_epoll_data_t {
+    nb_epoll_type_t type;
+    struct st_nb_conn_ctx_t *conn_ctx;
+    struct engine_request *offload_request;
+};
+
+struct st_nb_worker_thread_data_t {
+    size_t thread_index;
+    int epollfd;
+};
+
+static pthread_t nb_worker_threads[NEVERBLEED_MAX_WORKER_THREADS] = {0};
+static size_t nb_worker_threads_count = 0;
+
+struct st_nb_worker_thread_data_t nb_worker_threads_data[NEVERBLEED_MAX_WORKER_THREADS] = {0};
+
+static __thread struct st_nb_worker_thread_data_t *nb_thread_thdata;
 
 static int use_offload = 0;
+
+static int do_epoll_ctl(int epollfd, int op, int fd, struct epoll_event *event)
+{
+    int ret;
+    while ((ret = epoll_ctl(epollfd, op, fd, event) != 0) && errno == EINTR)
+        ;
+    return ret;
+}
 
 #if USE_OFFLOAD
 
 struct engine_request {
+    struct st_nb_conn_ctx_t *conn_ctx;
     neverbleed_iobuf_t *buf;
     int async_fd;
 #ifdef OPENSSL_IS_BORINGSSL
@@ -628,7 +676,7 @@ struct engine_request {
     } data;
     async_ctx *async_ctx;
 #else
-    int (*stub)(neverbleed_iobuf_t *);
+    int (*stub)(struct st_nb_conn_ctx_t *, neverbleed_iobuf_t *);
     struct {
         ASYNC_WAIT_CTX *ctx;
         ASYNC_JOB *job;
@@ -648,15 +696,7 @@ static void offload_free_request(struct engine_request *req)
     free(req);
 }
 
-static int do_epoll_ctl(int epollfd, int op, int fd, struct epoll_event *event)
-{
-    int ret;
-    while ((ret = epoll_ctl(epollfd, op, fd, event) != 0) && errno == EINTR)
-        ;
-    return ret;
-}
-
-static void register_wait_fd(struct engine_request *req)
+static void register_wait_fd(struct st_nb_conn_ctx_t *conn_ctx, struct engine_request *req)
 {
 #ifdef OPENSSL_IS_BORINGSSL
     ASYNC_WAIT_CTX *ctx = req->async_ctx->currjob->waitctx;
@@ -669,24 +709,32 @@ static void register_wait_fd(struct engine_request *req)
         dief("unexpected number of fds (%zu) requested in async mode\n", numfds);
     if (!ASYNC_WAIT_CTX_get_all_fds(ctx, &req->async_fd, &numfds))
         dief("ASYNC_WAIT_CTX_get_all_fds failed\n");
-    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = req};
-    if (do_epoll_ctl(conn_ctx.epollfd, EPOLL_CTL_ADD, req->async_fd, &ev) != 0)
+
+    struct st_nb_epoll_data_t *epoll_data = malloc(sizeof(*epoll_data));
+    if (epoll_data == NULL)
+        dief("no memory\n");
+    epoll_data->type = EPOLL_TYPE_OFFLOAD;
+    epoll_data->offload_request = req;
+    epoll_data->conn_ctx = conn_ctx;
+    conn_ctx_up_ref(conn_ctx);
+    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = epoll_data};
+    if (do_epoll_ctl(nb_thread_thdata->epollfd, EPOLL_CTL_ADD, req->async_fd, &ev) != 0)
         dief("epoll_ctl failed:%d\n", errno);
 }
 
 #endif
 
-static int send_responses(int cleanup)
+static int send_responses(struct st_nb_conn_ctx_t *conn_ctx, int cleanup)
 {
     neverbleed_iobuf_t *buf;
     int result = 0;
 
     /* Send all buffers that have data being filled. The lock is held until everything is being done, as this function can be called
      * from multiple threads simultaneously. */
-    while ((buf = conn_ctx.responses.first) != NULL && !buf->processing) {
-        if ((conn_ctx.responses.first = buf->next) == NULL)
-            conn_ctx.responses.next = &conn_ctx.responses.first;
-        if (!cleanup && iobuf_write(buf, conn_ctx.sockfd) != 0) {
+    while ((buf = conn_ctx->responses.first) != NULL && !buf->processing) {
+        if ((conn_ctx->responses.first = buf->next) == NULL)
+            conn_ctx->responses.next = &conn_ctx->responses.first;
+        if (!cleanup && iobuf_write(buf, conn_ctx->sockfd) != 0) {
             warnf(errno != 0 ? "write error" : "connection closed by client");
             result = -1;
         }
@@ -816,7 +864,7 @@ static int priv_enc_proxy(int flen, const unsigned char *from, unsigned char *to
     return priv_encdec_proxy("priv_enc", flen, from, to, rsa, padding);
 }
 
-static int priv_enc_stub(neverbleed_iobuf_t *buf)
+static int priv_enc_stub(struct st_nb_conn_ctx_t *conn_ctx, neverbleed_iobuf_t *buf)
 {
     return priv_encdec_stub(__FUNCTION__, RSA_private_encrypt, buf);
 }
@@ -826,7 +874,7 @@ static int priv_dec_proxy(int flen, const unsigned char *from, unsigned char *to
     return priv_encdec_proxy("priv_dec", flen, from, to, rsa, padding);
 }
 
-static int priv_dec_stub(neverbleed_iobuf_t *buf)
+static int priv_dec_stub(struct st_nb_conn_ctx_t *conn_ctx, neverbleed_iobuf_t *buf)
 {
     return priv_encdec_stub(__FUNCTION__, RSA_private_decrypt, buf);
 }
@@ -859,7 +907,7 @@ static int sign_proxy(int type, const unsigned char *m, unsigned int m_len, unsi
     return (int)ret;
 }
 
-static int sign_stub(neverbleed_iobuf_t *buf)
+static int sign_stub(struct st_nb_conn_ctx_t *conn_ctx, neverbleed_iobuf_t *buf)
 {
     unsigned char *m, sigret[4096];
     size_t type, m_len, key_index;
@@ -1094,14 +1142,14 @@ static EVP_PKEY *daemon_get_pkey(size_t key_index)
 
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
 
-static struct engine_request *bssl_offload_create_request(neverbleed_iobuf_t *buf, EVP_PKEY *pkey)
+static struct engine_request *bssl_offload_create_request(struct st_nb_conn_ctx_t *conn_ctx, neverbleed_iobuf_t *buf, EVP_PKEY *pkey)
 {
     RSA *_rsa = EVP_PKEY_get1_RSA(pkey);
 
     struct engine_request *req = malloc(sizeof(*req));
     if (req == NULL)
         dief("no memory\n");
-    *req = (struct engine_request){.buf = buf, .async_fd = -1, .async_ctx = bssl_qat_async_start_job(), .data.rsa = _rsa};
+    *req = (struct engine_request){.conn_ctx = conn_ctx, .buf = buf, .async_fd = -1, .async_ctx = bssl_qat_async_start_job(), .data.rsa = _rsa};
 
     if (req->async_ctx == NULL)
         dief("failed to initialize async job\n");
@@ -1111,7 +1159,7 @@ static struct engine_request *bssl_offload_create_request(neverbleed_iobuf_t *bu
     return req;
 }
 
-static void bssl_offload_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const EVP_MD *md, const void *signdata, size_t signlen,
+static void bssl_offload_digestsign(struct st_nb_conn_ctx_t *conn_ctx, neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const EVP_MD *md, const void *signdata, size_t signlen,
                                     int rsa_pss)
 {
     uint8_t digest[EVP_MAX_MD_SIZE];
@@ -1127,7 +1175,7 @@ static void bssl_offload_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, con
         EVP_MD_CTX_free(mdctx);
     }
 
-    struct engine_request *req = bssl_offload_create_request(buf, pkey);
+    struct engine_request *req = bssl_offload_create_request(conn_ctx, buf, pkey);
     size_t rsa_size = RSA_size(req->data.rsa), padded_len;
     int padding;
 
@@ -1164,12 +1212,12 @@ static void bssl_offload_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, con
         dief("sign_raw completed synchronously unexpectedly\n");
 
     buf->processing = 1;
-    register_wait_fd(req);
+    register_wait_fd(conn_ctx, req);
 }
 
-static int bssl_offload_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const void *src, size_t len)
+static int bssl_offload_decrypt(struct st_nb_conn_ctx_t *conn_ctx, neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const void *src, size_t len)
 {
-    struct engine_request *req = bssl_offload_create_request(buf, pkey);
+    struct engine_request *req = bssl_offload_create_request(conn_ctx, buf, pkey);
 
     /* dispatch RSA calculation */
     RSA_METHOD *meth = bssl_engine_get_rsa_method();
@@ -1184,7 +1232,7 @@ static int bssl_offload_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const v
         dief("RSA decrypt completed synchronously unexpectedly\n");
 
     buf->processing = 1;
-    register_wait_fd(req);
+    register_wait_fd(conn_ctx, req);
     return 1;
 
 Exit:
@@ -1194,7 +1242,7 @@ Exit:
 
 #endif
 
-static int digestsign_stub(neverbleed_iobuf_t *buf)
+static int digestsign_stub(struct st_nb_conn_ctx_t *conn_ctx, neverbleed_iobuf_t *buf)
 {
     size_t key_index, md_nid, signlen;
     void *signdata;
@@ -1226,7 +1274,7 @@ static int digestsign_stub(neverbleed_iobuf_t *buf)
 
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
     if (use_offload && EVP_PKEY_id(pkey) == EVP_PKEY_RSA) {
-        bssl_offload_digestsign(buf, pkey, md, signdata, signlen, rsa_pss);
+        bssl_offload_digestsign(conn_ctx, buf, pkey, md, signdata, signlen, rsa_pss);
         goto Exit;
     }
 #endif
@@ -1323,7 +1371,7 @@ void neverbleed_finish_digestsign(neverbleed_iobuf_t *buf, void **digest, size_t
     iobuf_dispose(buf);
 }
 
-static int decrypt_stub(neverbleed_iobuf_t *buf)
+static int decrypt_stub(struct st_nb_conn_ctx_t *conn_ctx, neverbleed_iobuf_t *buf)
 {
     size_t key_index, srclen;
     void *src;
@@ -1350,7 +1398,7 @@ static int decrypt_stub(neverbleed_iobuf_t *buf)
 
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
     if (use_offload) {
-        if (!bssl_offload_decrypt(buf, pkey, src, srclen))
+        if (!bssl_offload_decrypt(conn_ctx, buf, pkey, src, srclen))
             goto Softfail;
 
         goto Exit;
@@ -1645,61 +1693,6 @@ Respond:
     return 0;
 }
 
-#if NEVERBLEED_HAS_PTHREAD_SETAFFINITY_NP
-int neverbleed_setaffinity(neverbleed_t *nb, NEVERBLEED_CPU_SET_T *cpuset)
-{
-    struct st_neverbleed_thread_data_t *thdata = get_thread_data(nb);
-    neverbleed_iobuf_t buf = {NULL};
-    size_t ret;
-
-    iobuf_push_str(&buf, "setaffinity");
-    iobuf_push_bytes(&buf, cpuset, sizeof(*cpuset));
-    iobuf_transaction(&buf, thdata);
-
-    if (iobuf_shift_num(&buf, &ret) != 0) {
-        errno = 0;
-        dief("failed to parse response");
-    }
-    iobuf_dispose(&buf);
-
-    return (int)ret;
-}
-
-static int setaffinity_stub(neverbleed_iobuf_t *buf)
-{
-    char *cpuset_bytes;
-    size_t cpuset_len;
-    NEVERBLEED_CPU_SET_T cpuset;
-    int ret = 1;
-
-    if ((cpuset_bytes = iobuf_shift_bytes(buf, &cpuset_len)) == NULL) {
-        errno = 0;
-        warnf("%s: failed to parse request", __FUNCTION__);
-        return -1;
-    }
-
-    assert(cpuset_len == sizeof(NEVERBLEED_CPU_SET_T));
-    memcpy(&cpuset, cpuset_bytes, cpuset_len);
-
-#ifdef __NetBSD__
-    ret = pthread_setaffinity_np(pthread_self(), cpuset_size(cpuset), cpuset);
-#else
-    ret = pthread_setaffinity_np(pthread_self(), sizeof(NEVERBLEED_CPU_SET_T), &cpuset);
-#endif
-    if (ret != 0) {
-        ret = 1;
-        goto Respond;
-    }
-
-    ret = 0;
-
-Respond:
-    iobuf_dispose(buf);
-    iobuf_push_num(buf, ret);
-    return 0;
-}
-#endif
-
 __attribute__((noreturn)) static void *daemon_close_notify_thread(void *_close_notify_fd)
 {
     int close_notify_fd = (int)((char *)_close_notify_fd - (char *)NULL);
@@ -1744,7 +1737,7 @@ static int del_pkey_stub(neverbleed_iobuf_t *buf)
     return 0;
 }
 
-#define offload_start(stub, buf) ((stub)(buf))
+#define offload_start(conn_ctx, stub, buf) ((stub)(conn_ctx, buf))
 
 #if USE_OFFLOAD
 #ifdef OPENSSL_IS_BORINGSSL
@@ -1753,7 +1746,7 @@ static int offload_resume(struct engine_request *req)
 {
     size_t outlen;
 
-    if (do_epoll_ctl(conn_ctx.epollfd, EPOLL_CTL_DEL, req->async_fd, NULL) != 0)
+    if (do_epoll_ctl(nb_thread_thdata->epollfd, EPOLL_CTL_DEL, req->async_fd, NULL) != 0)
         dief("epoll_ctl failed:%d\n", errno);
 
     /* get result */
@@ -1776,22 +1769,22 @@ static int offload_resume(struct engine_request *req)
 static int offload_jobfunc(void *_req)
 {
     struct engine_request *req = *(void **)_req;
-    return req->stub(req->buf);
+    return req->stub(req->conn_ctx, req->buf);
 }
 
 #undef offload_start
-static int offload_start(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *buf)
+static int offload_start(struct st_nb_conn_ctx_t *conn_ctx, int (*stub)(struct st_nb_conn_ctx_t *conn_ctx, neverbleed_iobuf_t *), neverbleed_iobuf_t *buf)
 {
     /* if engine is not used, run the stub synchronously */
     if (!use_offload)
-        return stub(buf);
+        return stub(conn_ctx, buf);
 
     buf->processing = 1;
 
     struct engine_request *req = malloc(sizeof(*req));
     if (req == NULL)
         dief("no memory");
-    *req = (struct engine_request){.buf = buf, .async_fd = -1, .stub = stub};
+    *req = (struct engine_request){.conn_ctx = conn_ctx, .buf = buf, .async_fd = -1, .stub = stub};
 
     if ((req->async.ctx = ASYNC_WAIT_CTX_new()) == NULL)
         dief("failed to create ASYNC_WAIT_CTX\n");
@@ -1799,7 +1792,7 @@ static int offload_start(int (*stub)(neverbleed_iobuf_t *), neverbleed_iobuf_t *
     int ret;
     switch (ASYNC_start_job(&req->async.job, req->async.ctx, &ret, offload_jobfunc, &req, sizeof(req))) {
     case ASYNC_PAUSE: /* operation running async; register fd and bail out */
-        register_wait_fd(req);
+        register_wait_fd(conn_ctx, req);
         return 0;
     case ASYNC_FINISH: /* completed synchronously */
         buf->processing = 0;
@@ -1823,7 +1816,7 @@ static int offload_resume(struct engine_request *req)
         /* assume that wait fd is unchanged */
         return 0;
     case ASYNC_FINISH:
-        if (do_epoll_ctl(conn_ctx.epollfd, EPOLL_CTL_DEL, req->async_fd, NULL) != 0)
+        if (do_epoll_ctl(nb_thread_thdata->epollfd, EPOLL_CTL_DEL, req->async_fd, NULL) != 0)
             dief("epoll_ctl failed:%d\n", errno);
         break;
     default:
@@ -1837,179 +1830,193 @@ static int offload_resume(struct engine_request *req)
 
     return ret;
 }
-
-#endif
 #endif
 
-/**
- * This function waits for the provided socket to become readable, then calls `nanosleep(1)` before returning.
- * The intention behind sleep is to provide the application to complete its event loop before the neverbleed process starts
- * spending CPU cycles on the time-consuming RSA operation.
- * In addition, when QAT is used, this function processes completion notifications from QAT and sends the responses.
- */
-static int wait_for_data(int cleanup)
-{
-#if USE_OFFLOAD
-
-    struct epoll_event events[20];
-    int has_read = 0, num_events;
-
-    do {
-        while ((num_events = epoll_wait(conn_ctx.epollfd, events, sizeof(events) / sizeof(events[0]), -1)) == -1 &&
-               (errno == EAGAIN || errno == EINTR))
-            ;
-        if (num_events == -1)
-            dief("epoll_wait(2):%d\n", errno);
-        for (int i = 0; i < num_events; ++i) {
-            if (events[i].data.ptr == NULL) {
-                has_read = 1;
-            } else {
-                struct engine_request *req = events[i].data.ptr;
-                int ret;
-                if ((ret = offload_resume(req)) != 0)
-                    return ret;
-                if ((ret = send_responses(0)) != 0)
-                    return ret;
-            }
-        }
-    } while (!has_read);
-
-#else
-
-    fd_set rfds;
+int handle_offload_event(struct engine_request *req, struct st_nb_conn_ctx_t *conn_ctx) {
     int ret;
-    FD_ZERO(&rfds);
-    if (!cleanup)
-        FD_SET(conn_ctx.sockfd, &rfds);
+    if ((ret = offload_resume(req)) != 0)
+        return ret;
 
-    while ((ret = select(conn_ctx.sockfd + 1, &rfds, NULL, NULL, NULL)) == -1 && (errno == EAGAIN || errno == EINTR))
-        ;
-    if (ret == -1)
-        dief("select(2):%d\n", errno);
+    if ((ret = send_responses(conn_ctx, 0)) != 0)
+        return ret;
 
-#endif
-
-    // yield when data is available
-    struct timespec tv = {.tv_nsec = 1};
-    (void)nanosleep(&tv, NULL);
-
-    return 0;
+    return ret;
 }
 
-static void *daemon_conn_thread(void *_sock_fd)
-{
-    conn_ctx.sockfd = (int)((char *)_sock_fd - (char *)NULL);
-    conn_ctx.responses.next = &conn_ctx.responses.first;
+#endif
+
+int handle_conn_event(struct st_nb_conn_ctx_t *conn_ctx) {
     neverbleed_iobuf_t *buf = NULL;
+    free(buf);
 
-#if USE_OFFLOAD
-    if ((conn_ctx.epollfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
-        dief("epoll_create1 failed:%d\n", errno);
-    {
-        struct epoll_event ev = {.events = EPOLLIN};
-        if (do_epoll_ctl(conn_ctx.epollfd, EPOLL_CTL_ADD, conn_ctx.sockfd, &ev) != 0)
-            dief("epoll_ctl failed:%d\n", errno);
+    buf = malloc(sizeof(*buf));
+    if (buf == NULL)
+        dief("no memory");
+    *buf = (neverbleed_iobuf_t){};
+    char *cmd;
+    if (iobuf_read(buf, conn_ctx->sockfd) != 0) {
+        if (errno != 0)
+            warnf("read error");
+        goto Exit;
     }
-#endif
-
-    { /* authenticate */
-        unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
-        if (read_nbytes(conn_ctx.sockfd, &auth_token, sizeof(auth_token)) != 0) {
-            warnf("failed to receive authencication token from client");
-            goto Exit;
-        }
-        if (memcmp(auth_token, daemon_vars.nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE) != 0) {
-            warnf("client authentication failed");
-            goto Exit;
-        }
+    if ((cmd = iobuf_shift_str(buf)) == NULL) {
+        errno = 0;
+        warnf("failed to parse request");
+        goto Exit;
     }
 
-    while (1) {
-        if (wait_for_data(0) != 0)
-            break;
-        free(buf);
-        buf = malloc(sizeof(*buf));
-        if (buf == NULL)
-            dief("no memory");
-        *buf = (neverbleed_iobuf_t){};
-        char *cmd;
-        if (iobuf_read(buf, conn_ctx.sockfd) != 0) {
-            if (errno != 0)
-                warnf("read error");
-            break;
-        }
-        if ((cmd = iobuf_shift_str(buf)) == NULL) {
-            errno = 0;
-            warnf("failed to parse request");
-            break;
-        }
+
 #if !defined(OPENSSL_IS_BORINGSSL)
-        if (strcmp(cmd, "priv_enc") == 0) {
-            if (offload_start(priv_enc_stub, buf) != 0)
-                break;
-        } else if (strcmp(cmd, "priv_dec") == 0) {
-            if (offload_start(priv_dec_stub, buf) != 0)
-                break;
-        } else if (strcmp(cmd, "sign") == 0) {
-            if (offload_start(sign_stub, buf) != 0)
-                break;
+    if (strcmp(cmd, "priv_enc") == 0) {
+        if (offload_start(conn_ctx, priv_enc_stub, buf) != 0)
+            goto Exit;
+    } else if (strcmp(cmd, "priv_dec") == 0) {
+        if (offload_start(conn_ctx, priv_dec_stub, buf) != 0)
+            goto Exit;
+    } else if (strcmp(cmd, "sign") == 0) {
+        if (offload_start(conn_ctx, sign_stub, buf) != 0)
+            goto Exit;
 #ifdef NEVERBLEED_ECDSA
-        } else if (strcmp(cmd, "ecdsa_sign") == 0) {
-            if (ecdsa_sign_stub(buf) != 0)
-                break;
+    } else if (strcmp(cmd, "ecdsa_sign") == 0) {
+        if (ecdsa_sign_stub(buf) != 0)
+            goto Exit;
 #endif
-        } else
+    } else
 #endif
-            if (strcmp(cmd, "digestsign") == 0) {
-            if (digestsign_stub(buf) != 0)
-                break;
-        } else if (strcmp(cmd, "digestsign-rsa") == 0) {
-            if (offload_start(digestsign_stub, buf) != 0)
-                break;
-        } else if (strcmp(cmd, "decrypt") == 0) {
-            if (offload_start(decrypt_stub, buf) != 0)
-                break;
-        } else if (strcmp(cmd, "load_key") == 0) {
-            if (load_key_stub(buf) != 0)
-                break;
-        } else if (strcmp(cmd, "del_pkey") == 0) {
-            if (del_pkey_stub(buf) != 0)
-                break;
-            iobuf_dispose(buf);
-            // "del_pkey" command is fire-and-forget, it cannot fail, so doesn't have a response
-            continue;
-        } else if (strcmp(cmd, "setuidgid") == 0) {
-            if (setuidgid_stub(buf) != 0)
-                break;
-#if NEVERBLEED_HAS_PTHREAD_SETAFFINITY_NP
-        } else if (strcmp(cmd, "setaffinity") == 0) {
-            if (setaffinity_stub(buf) != 0)
-                break;
-#endif
-        } else {
-            warnf("unknown command:%s", cmd);
-            break;
-        }
-        /* add response to chain */
-        *conn_ctx.responses.next = buf;
-        conn_ctx.responses.next = &buf->next;
-        buf = NULL; /* do not free */
-
-        /* send responses if possible */
-        if (send_responses(0) != 0)
-            break;
+    if (strcmp(cmd, "digestsign") == 0) {
+        if (digestsign_stub(conn_ctx, buf) != 0)
+            goto Exit;
+    } else if (strcmp(cmd, "digestsign-rsa") == 0) {
+        if (offload_start(conn_ctx, digestsign_stub, buf) != 0)
+            goto Exit;
+    } else if (strcmp(cmd, "decrypt") == 0) {
+        if (offload_start(conn_ctx, decrypt_stub, buf) != 0)
+            goto Exit;
+    } else if (strcmp(cmd, "load_key") == 0) {
+        if (load_key_stub(buf) != 0)
+            goto Exit;
+    } else if (strcmp(cmd, "del_pkey") == 0) {
+        if (del_pkey_stub(buf) != 0)
+            goto Exit;
+        iobuf_dispose(buf);
+        // "del_pkey" command is fire-and-forget, it cannot fail, so doesn't have a response
+        goto NoResponse;
+    } else if (strcmp(cmd, "setuidgid") == 0) {
+        if (setuidgid_stub(buf) != 0)
+            goto Exit;
+    } else {
+        warnf("unknown command:%s", cmd);
+        goto Exit;
     }
+
+    /* add response to chain */
+    *conn_ctx->responses.next = buf;
+    conn_ctx->responses.next = &buf->next;
+    buf = NULL; /* do not free */
+
+    /* send responses if possible */
+    if (send_responses(conn_ctx, 0) != 0)
+        goto Exit;
+
+NoResponse:
+    free(buf);
+    return 0;
 
 Exit:
     free(buf);
-    /* run the loop while async ops are running */
-    while (conn_ctx.responses.first != NULL)
-        wait_for_data(1);
+    return 1;
+}
 
-    close(conn_ctx.sockfd);
-#ifdef __linux
-    close(conn_ctx.epollfd);
+static void *daemon_conn_thread(void *_thdata)
+{
+    nb_thread_thdata = (struct st_nb_worker_thread_data_t *)_thdata;
+
+    struct epoll_event events[daemon_vars.max_events];
+    int num_events;
+
+    while (1) {
+        while ((num_events = epoll_wait(nb_thread_thdata->epollfd, events, sizeof(events) / sizeof(events[0]), -1)) == -1 &&
+                (errno == EAGAIN || errno == EINTR));
+
+        if (num_events == -1)
+            dief("epoll_wait(2):%d\n", errno);
+
+        for (int i = 0; i < num_events; ++i) {
+            struct st_nb_epoll_data_t *epoll_data = events[i].data.ptr;
+
+            if (epoll_data == NULL) {
+                warnf("received epoll event with null data, skipping");
+                continue;
+            }
+
+            pthread_mutex_lock(&epoll_data->conn_ctx->lock);
+
+            // handle read-ready events
+            if ((events[i].events & (EPOLLIN)) != 0) {
+                switch (epoll_data->type) {
+                    case EPOLL_TYPE_CONN:
+                        if ((events[i].events & (EPOLLHUP | EPOLLERR)) != 0) {
+                            if (epoll_data->conn_ctx->responses.first != NULL) {
+                                // async ops pending, don't close yet
+                            } else {
+                                goto Complete;
+                            }
+                        }
+
+                        int ret;
+                        struct pollfd poll_fd;
+                        poll_fd.fd = epoll_data->conn_ctx->sockfd;
+                        poll_fd.events = POLLIN;
+                        while ((ret = poll(&poll_fd, 1, 0)) == -1 && (errno == EAGAIN || errno == EINTR))
+                            ;
+
+                        if (ret == -1)
+                            dief("poll(2):%d\n", errno);
+
+                        if (ret != 0) {
+                            if (handle_conn_event(epoll_data->conn_ctx) != 0)
+                                goto Exit;
+                        }
+
+                        break;
+#if USE_OFFLOAD
+                    case EPOLL_TYPE_OFFLOAD: {
+                        if (handle_offload_event(epoll_data->offload_request, epoll_data->conn_ctx) != 0)
+                            goto Exit;
+
+                        goto Complete;
+                     }
 #endif
+
+                    default:
+                        dief("unhandled epoll data type: %d", epoll_data->type);
+                        break;
+                }
+            }
+
+            pthread_mutex_unlock(&epoll_data->conn_ctx->lock);
+            continue;
+
+Complete:
+            pthread_mutex_unlock(&epoll_data->conn_ctx->lock);
+            if (epoll_data->type == EPOLL_TYPE_CONN) {
+                if (do_epoll_ctl(nb_thread_thdata->epollfd, EPOLL_CTL_DEL, epoll_data->conn_ctx->sockfd, NULL) != 0)
+                    dief("epoll_ctl failed:%d\n", errno);
+            }
+            conn_ctx_down_ref(epoll_data->conn_ctx);
+            free(epoll_data);
+            continue;
+Exit:
+            pthread_mutex_unlock(&epoll_data->conn_ctx->lock);
+            goto Fatal;
+        }
+
+        continue;
+
+Fatal:
+        break;
+    }
+
 
     return NULL;
 }
@@ -2055,11 +2062,10 @@ static void cleanup_fds(int listen_fd, int close_notify_fd)
     closefrom(maxfd + 1);
 }
 
-__attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notify_fd, const char *tempdir)
+__attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notify_fd, size_t worker_threads, const char *tempdir)
 {
     pthread_t tid;
     pthread_attr_t thattr;
-    int sock_fd;
 
     cleanup_fds(listen_fd, close_notify_fd);
     pthread_attr_init(&thattr);
@@ -2090,11 +2096,63 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
     if (pthread_create(&tid, &thattr, daemon_close_notify_thread, (char *)NULL + close_notify_fd) != 0)
         dief("pthread_create failed");
 
-    while (1) {
-        while ((sock_fd = accept(listen_fd, NULL, NULL)) == -1)
-            ;
-        if (pthread_create(&tid, &thattr, daemon_conn_thread, (char *)NULL + sock_fd) != 0)
+    nb_worker_threads_count = worker_threads;
+    for (int i = 0; i < worker_threads; i++) {
+        struct st_nb_worker_thread_data_t *thdata = &nb_worker_threads_data[i];
+        thdata->thread_index = i;
+
+        if ((thdata->epollfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
+            dief("epoll_create1 failed:%d\n", errno);
+
+        if (pthread_create(&nb_worker_threads[i], &thattr, daemon_conn_thread, (void *)thdata) != 0)
             dief("pthread_create failed");
+    }
+    while (1) {
+        struct st_nb_conn_ctx_t *conn_ctx = NULL;
+        int sockfd;
+        while ((sockfd = accept(listen_fd, NULL, NULL)) == -1)
+            ;
+
+        { /* authenticate */
+            unsigned char auth_token[NEVERBLEED_AUTH_TOKEN_SIZE];
+            if (read_nbytes(sockfd, &auth_token, sizeof(auth_token)) != 0) {
+                warnf("failed to receive authencication token from client");
+                goto Fail;
+            }
+            if (memcmp(auth_token, daemon_vars.nb->auth_token, NEVERBLEED_AUTH_TOKEN_SIZE) != 0) {
+                warnf("client authentication failed");
+                goto Fail;
+            }
+        }
+
+        if ((conn_ctx = malloc(sizeof(*conn_ctx))) == NULL)
+            dief("could not allocate conn_ctx");
+
+        conn_ctx->responses.first = NULL;
+        conn_ctx->responses.next = &conn_ctx->responses.first;
+        pthread_mutex_init(&conn_ctx->lock, NULL);
+        conn_ctx->sockfd = sockfd;
+        conn_ctx->ref_count = 0;
+
+        for (int i=0; i < nb_worker_threads_count; i++) {
+            struct st_nb_epoll_data_t *epoll_data = malloc(sizeof(*epoll_data));
+            if (epoll_data == NULL)
+                dief("no memory\n");
+
+            epoll_data->type = EPOLL_TYPE_CONN;
+            epoll_data->conn_ctx = conn_ctx;
+            conn_ctx_up_ref(conn_ctx);
+
+            int epollfd = nb_worker_threads_data[i].epollfd;
+            struct epoll_event ev = {.events = EPOLLIN | EPOLLEXCLUSIVE, .data.ptr = (void*)epoll_data};
+            if (do_epoll_ctl(epollfd, EPOLL_CTL_ADD, conn_ctx->sockfd, &ev) != 0)
+                dief("epoll_ctl failed:%d\n", errno);
+        }
+
+        continue;
+Fail:
+        close(sockfd);
+        free(conn_ctx);
     }
 }
 
@@ -2129,10 +2187,12 @@ static RSA_METHOD static_rsa_method = {
 
 #endif
 
-int neverbleed_init(neverbleed_t *nb, char *errbuf)
+int neverbleed_init(neverbleed_t *nb, size_t worker_threads, size_t max_events, char *errbuf)
 {
     int pipe_fds[2] = {-1, -1}, listen_fd = -1;
     char *tempdir = NULL;
+
+    daemon_vars.max_events = max_events;
 
     /* setup the daemon */
     if (pipe(pipe_fds) != 0) {
@@ -2186,7 +2246,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
         if (neverbleed_post_fork_cb != NULL)
             neverbleed_post_fork_cb();
         daemon_vars.nb = nb;
-        daemon_main(listen_fd, pipe_fds[0], tempdir);
+        daemon_main(listen_fd, pipe_fds[0], worker_threads, tempdir);
         break;
     default:
         break;
