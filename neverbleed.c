@@ -1469,35 +1469,6 @@ static int ec_sig_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t si
     return 1;
 }
 
-static int ec_sig_digest_sign_init(void *vctx, const char *mdname, void *vkey, const OSSL_PARAM params[])
-{
-    struct ec_sig_ctx *ctx = vctx;
-    ctx->keydata = vkey;
-    if (mdname != NULL) {
-        const EVP_MD *md = EVP_get_digestbyname(mdname);
-        ctx->md_nid = md != NULL ? EVP_MD_type(md) : NID_undef;
-    }
-    ctx->tbslen = 0;
-    return 1;
-}
-
-static int ec_sig_digest_sign_update(void *vctx, const unsigned char *data, size_t datalen)
-{
-    struct ec_sig_ctx *ctx = vctx;
-    if (ctx->tbslen + datalen > ctx->tbscap) {
-        size_t newcap = ctx->tbslen + datalen;
-        if (newcap < 256)
-            newcap = 256;
-        ctx->tbsdata = OPENSSL_realloc(ctx->tbsdata, newcap);
-        if (ctx->tbsdata == NULL)
-            return 0;
-        ctx->tbscap = newcap;
-    }
-    memcpy(ctx->tbsdata + ctx->tbslen, data, datalen);
-    ctx->tbslen += datalen;
-    return 1;
-}
-
 static int ec_sig_digest_sign_final(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize)
 {
     struct ec_sig_ctx *ctx = vctx;
@@ -1561,7 +1532,7 @@ static int ec_sig_digest_sign(void *vctx, unsigned char *sig, size_t *siglen, si
         *siglen = 2 * (order_bytes + 1) + 6;
         return 1;
     }
-    if (!ec_sig_digest_sign_update(vctx, tbs, tbslen))
+    if (!sig_digest_sign_update(vctx, tbs, tbslen))
         return 0;
     return ec_sig_digest_sign_final(vctx, sig, siglen, sigsize);
 }
@@ -1617,8 +1588,8 @@ static const OSSL_DISPATCH ec_sig_functions[] = {
     {OSSL_FUNC_SIGNATURE_FREECTX, (void (*)(void))ec_sig_freectx},
     {OSSL_FUNC_SIGNATURE_SIGN_INIT, (void (*)(void))ec_sig_sign_init},
     {OSSL_FUNC_SIGNATURE_SIGN, (void (*)(void))ec_sig_sign},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT, (void (*)(void))ec_sig_digest_sign_init},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE, (void (*)(void))ec_sig_digest_sign_update},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT, (void (*)(void))sig_digest_sign_init},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE, (void (*)(void))sig_digest_sign_update},
     {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_FINAL, (void (*)(void))ec_sig_digest_sign_final},
     {OSSL_FUNC_SIGNATURE_DIGEST_SIGN, (void (*)(void))ec_sig_digest_sign},
     {OSSL_FUNC_SIGNATURE_SET_CTX_PARAMS, (void (*)(void))ec_sig_set_ctx_params},
