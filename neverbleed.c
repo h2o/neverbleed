@@ -56,9 +56,7 @@
 #include <openssl/opensslconf.h>
 #include <openssl/opensslv.h>
 
-#if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(OPENSSL_NO_EC) &&                                                            \
-    (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER >= 0x2090100fL)
-/* EC_KEY_METHOD and related APIs are avaliable, so ECDSA is enabled. */
+#if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(OPENSSL_NO_EC)
 #define NEVERBLEED_ECDSA
 #endif
 
@@ -70,7 +68,7 @@
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
-#if !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER)
+#if !defined(OPENSSL_IS_BORINGSSL)
 #include <openssl/core.h>
 #include <openssl/core_dispatch.h>
 #include <openssl/core_names.h>
@@ -80,7 +78,7 @@
 #endif
 
 #ifdef __linux
-#if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(LIBRESSL_VERSION_NUMBER) && !defined(OPENSSL_IS_BORINGSSL)
+#if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(OPENSSL_IS_BORINGSSL)
 #define USE_OFFLOAD 1
 #endif
 #if defined(OPENSSL_IS_BORINGSSL) && defined(NEVERBLEED_BORINGSSL_USE_QAT)
@@ -92,48 +90,6 @@ extern int bssl_async_wait_ctx_get_all_fds(ASYNC_WAIT_CTX *ctx, OSSL_ASYNC_FD *f
 #endif
 #define USE_OFFLOAD 1
 #endif
-#endif
-
-#if OPENSSL_VERSION_NUMBER < 0x1010000fL || (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x2070000fL)
-
-static void RSA_get0_key(const RSA *rsa, const BIGNUM **n, const BIGNUM **e, const BIGNUM **d)
-{
-    if (n) {
-        *n = rsa->n;
-    }
-
-    if (e) {
-        *e = rsa->e;
-    }
-
-    if (d) {
-        *d = rsa->d;
-    }
-}
-
-static int RSA_set0_key(RSA *rsa, BIGNUM *n, BIGNUM *e, BIGNUM *d)
-{
-    if (n == NULL || e == NULL) {
-        return 0;
-    }
-
-    BN_free(rsa->n);
-    BN_free(rsa->e);
-    BN_free(rsa->d);
-    rsa->n = n;
-    rsa->e = e;
-    rsa->d = d;
-
-    return 1;
-}
-
-static void RSA_set_flags(RSA *r, int flags)
-{
-    r->flags |= flags;
-}
-
-#define EVP_PKEY_up_ref(p) CRYPTO_add(&(p)->references, 1, CRYPTO_LOCK_EVP_PKEY)
-
 #endif
 
 #include "neverbleed.h"
@@ -3217,7 +3173,7 @@ Fail:
     }
     if (listen_fd != -1)
         close(listen_fd);
-#if !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER)
+#if !defined(OPENSSL_IS_BORINGSSL)
     if (nb->provider != NULL) {
         OSSL_PROVIDER_unload(nb->provider);
         nb->provider = NULL;

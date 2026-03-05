@@ -26,7 +26,7 @@
 #include <sys/un.h>
 #include <openssl/opensslv.h>
 
-#if !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER)
+#if !defined(OPENSSL_IS_BORINGSSL)
 #include <openssl/provider.h>
 #endif
 
@@ -50,7 +50,7 @@ extern "C" {
 #define NEVERBLEED_AUTH_TOKEN_SIZE 32
 
 typedef struct st_neverbleed_t {
-#if !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER)
+#if !defined(OPENSSL_IS_BORINGSSL)
     OSSL_PROVIDER *provider;
 #endif
     pid_t daemon_pid;
