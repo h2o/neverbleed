@@ -56,29 +56,21 @@
 #include <openssl/opensslconf.h>
 #include <openssl/opensslv.h>
 
-#if defined(LIBRESSL_VERSION_NUMBER) ? LIBRESSL_VERSION_NUMBER >= 0x3050000fL : OPENSSL_VERSION_NUMBER >= 0x1010000fL
-/* RSA_METHOD is opaque, so RSA_meth* are used. */
-#define NEVERBLEED_OPAQUE_RSA_METHOD
-#endif
-
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(OPENSSL_NO_EC) &&                                                            \
     (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER >= 0x2090100fL)
 /* EC_KEY_METHOD and related APIs are avaliable, so ECDSA is enabled. */
 #define NEVERBLEED_ECDSA
 #endif
 
-#if !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
-#define NEVERBLEED_PROVIDER
-#endif
-
 #include <openssl/bn.h>
 #ifdef NEVERBLEED_ECDSA
 #include <openssl/ec.h>
 #endif
+#include <openssl/engine.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
-#ifdef NEVERBLEED_PROVIDER
+#if !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 #include <openssl/core.h>
 #include <openssl/core_dispatch.h>
 #include <openssl/core_names.h>
@@ -147,11 +139,6 @@ static void RSA_set_flags(RSA *r, int flags)
 #include "neverbleed.h"
 
 enum neverbleed_type { NEVERBLEED_TYPE_ERROR, NEVERBLEED_TYPE_RSA, NEVERBLEED_TYPE_ECDSA };
-
-struct st_neverbleed_rsa_exdata_t {
-    neverbleed_t *nb;
-    size_t key_index;
-};
 
 struct st_neverbleed_thread_data_t {
     pid_t self_pid;
@@ -551,51 +538,6 @@ void neverbleed_transaction_write(neverbleed_t *nb, neverbleed_iobuf_t *buf)
     iobuf_transaction_write(buf, thdata);
 }
 
-static void do_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
-{
-    /* when other engines are used, this callback gets called without neverbleed data */
-    if (ptr == NULL)
-        return;
-    struct st_neverbleed_rsa_exdata_t *exdata = ptr;
-    struct st_neverbleed_thread_data_t *thdata = get_thread_data(exdata->nb);
-
-    neverbleed_iobuf_t buf = {NULL};
-    iobuf_push_str(&buf, "del_pkey");
-    iobuf_push_num(&buf, exdata->key_index);
-    // "del_pkey" command is fire-and-forget, it cannot fail, so doesn't have a response
-    iobuf_transaction_no_response(&buf, thdata);
-
-    free(exdata);
-}
-
-#if !defined(NEVERBLEED_PROVIDER)
-static int get_rsa_exdata_idx(void);
-static void rsa_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
-{
-    assert(idx == get_rsa_exdata_idx());
-    do_exdata_free_callback(parent, ptr, ad, idx, argl, argp);
-}
-
-static int get_rsa_exdata_idx(void)
-{
-    static volatile int index;
-    NEVERBLEED_MULTITHREAD_ONCE({
-        index = RSA_get_ex_new_index(0, NULL, NULL, NULL, rsa_exdata_free_callback);
-    });
-    return index;
-}
-static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t **exdata,
-                             struct st_neverbleed_thread_data_t **thdata)
-{
-    *exdata = RSA_get_ex_data(rsa, get_rsa_exdata_idx());
-    if (*exdata == NULL) {
-        errno = 0;
-        dief("invalid internal ref");
-    }
-    *thdata = get_thread_data((*exdata)->nb);
-}
-#endif /* !NEVERBLEED_PROVIDER */
-
 static struct {
     struct {
         pthread_mutex_t lock;
@@ -764,36 +706,6 @@ static size_t daemon_set_pkey(EVP_PKEY *pkey)
     return index;
 }
 
-#if !defined(NEVERBLEED_PROVIDER)
-static int priv_encdec_proxy(const char *cmd, int flen, const unsigned char *from, unsigned char *_to, RSA *rsa, int padding)
-{
-    struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
-    neverbleed_iobuf_t buf = {NULL};
-    size_t ret;
-    unsigned char *to;
-    size_t tolen;
-
-    get_privsep_data(rsa, &exdata, &thdata);
-
-    iobuf_push_str(&buf, cmd);
-    iobuf_push_bytes(&buf, from, flen);
-    iobuf_push_num(&buf, exdata->key_index);
-    iobuf_push_num(&buf, padding);
-
-    iobuf_transaction(&buf, thdata);
-
-    if (iobuf_shift_num(&buf, &ret) != 0 || (to = iobuf_shift_bytes(&buf, &tolen)) == NULL) {
-        errno = 0;
-        dief("failed to parse response");
-    }
-    memcpy(_to, to, tolen);
-    iobuf_dispose(&buf);
-
-    return (int)ret;
-}
-#endif /* !NEVERBLEED_PROVIDER */
-
 static int priv_encdec_stub(const char *name,
                             int (*func)(int flen, const unsigned char *from, unsigned char *to, RSA *rsa, int padding),
                             neverbleed_iobuf_t *buf)
@@ -827,59 +739,15 @@ static int priv_encdec_stub(const char *name,
 
 #if !defined(OPENSSL_IS_BORINGSSL)
 
-#if !defined(NEVERBLEED_PROVIDER)
-static int priv_enc_proxy(int flen, const unsigned char *from, unsigned char *to, RSA *rsa, int padding)
-{
-    return priv_encdec_proxy("priv_enc", flen, from, to, rsa, padding);
-}
-#endif
-
 static int priv_enc_stub(neverbleed_iobuf_t *buf)
 {
     return priv_encdec_stub(__FUNCTION__, RSA_private_encrypt, buf);
 }
 
-#if !defined(NEVERBLEED_PROVIDER)
-static int priv_dec_proxy(int flen, const unsigned char *from, unsigned char *to, RSA *rsa, int padding)
-{
-    return priv_encdec_proxy("priv_dec", flen, from, to, rsa, padding);
-}
-#endif
-
 static int priv_dec_stub(neverbleed_iobuf_t *buf)
 {
     return priv_encdec_stub(__FUNCTION__, RSA_private_decrypt, buf);
 }
-
-#if !defined(NEVERBLEED_PROVIDER)
-static int sign_proxy(int type, const unsigned char *m, unsigned int m_len, unsigned char *_sigret, unsigned *_siglen,
-                      const RSA *rsa)
-{
-    struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
-    neverbleed_iobuf_t buf = {NULL};
-    size_t ret, siglen;
-    unsigned char *sigret;
-
-    get_privsep_data(rsa, &exdata, &thdata);
-
-    iobuf_push_str(&buf, "sign");
-    iobuf_push_num(&buf, type);
-    iobuf_push_bytes(&buf, m, m_len);
-    iobuf_push_num(&buf, exdata->key_index);
-    iobuf_transaction(&buf, thdata);
-
-    if (iobuf_shift_num(&buf, &ret) != 0 || (sigret = iobuf_shift_bytes(&buf, &siglen)) == NULL) {
-        errno = 0;
-        dief("failed to parse response");
-    }
-    memcpy(_sigret, sigret, siglen);
-    *_siglen = (unsigned)siglen;
-    iobuf_dispose(&buf);
-
-    return (int)ret;
-}
-#endif
 
 static int sign_stub(neverbleed_iobuf_t *buf)
 {
@@ -908,10 +776,6 @@ static int sign_stub(neverbleed_iobuf_t *buf)
 
     return 0;
 }
-
-#endif /* !OPENSSL_IS_BORINGSSL */
-
-#ifdef NEVERBLEED_PROVIDER
 
 /* ======================== OpenSSL 3 Provider ======================== */
 
@@ -2095,11 +1959,11 @@ static int nb_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH 
     return 1;
 }
 
-#endif /* NEVERBLEED_PROVIDER */
+#endif /* !OPENSSL_IS_BORINGSSL */
 
 static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebuf, const char *nbuf)
 {
-#ifdef NEVERBLEED_PROVIDER
+    (void)nb;
     BIGNUM *e = NULL, *n = NULL;
     EVP_PKEY *pkey = NULL;
     OSSL_PARAM_BLD *bld = NULL;
@@ -2136,40 +2000,6 @@ static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebu
     BN_free(e);
     BN_free(n);
     return pkey;
-#else
-    struct st_neverbleed_rsa_exdata_t *exdata;
-    RSA *rsa;
-    EVP_PKEY *pkey;
-    BIGNUM *e = NULL, *n = NULL;
-
-    if ((exdata = malloc(sizeof(*exdata))) == NULL) {
-        fprintf(stderr, "no memory\n");
-        abort();
-    }
-    exdata->nb = nb;
-    exdata->key_index = key_index;
-
-    rsa = RSA_new_method(nb->engine);
-    RSA_set_ex_data(rsa, get_rsa_exdata_idx(), exdata);
-    if (BN_hex2bn(&e, ebuf) == 0) {
-        fprintf(stderr, "failed to parse e:%s\n", ebuf);
-        abort();
-    }
-    if (BN_hex2bn(&n, nbuf) == 0) {
-        fprintf(stderr, "failed to parse n:%s\n", nbuf);
-        abort();
-    }
-    RSA_set0_key(rsa, n, e, NULL);
-#if !defined(OPENSSL_IS_BORINGSSL)
-    RSA_set_flags(rsa, RSA_FLAG_EXT_PKEY);
-#endif
-
-    pkey = EVP_PKEY_new();
-    EVP_PKEY_set1_RSA(pkey, rsa);
-    RSA_free(rsa);
-
-    return pkey;
-#endif /* NEVERBLEED_PROVIDER */
 }
 
 #ifdef NEVERBLEED_ECDSA
@@ -2216,76 +2046,10 @@ static int ecdsa_sign_stub(neverbleed_iobuf_t *buf)
     return 0;
 }
 
-#if !defined(NEVERBLEED_PROVIDER)
-
-static int get_ecdsa_exdata_idx(void);
-static void ecdsa_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
-{
-    assert(idx == get_ecdsa_exdata_idx());
-    do_exdata_free_callback(parent, ptr, ad, idx, argl, argp);
-}
-
-static int get_ecdsa_exdata_idx(void)
-{
-    static volatile int index;
-    NEVERBLEED_MULTITHREAD_ONCE({
-        index = EC_KEY_get_ex_new_index(0, NULL, NULL, NULL, ecdsa_exdata_free_callback);
-    });
-    return index;
-}
-
-static void ecdsa_get_privsep_data(const EC_KEY *ec_key, struct st_neverbleed_rsa_exdata_t **exdata,
-                                   struct st_neverbleed_thread_data_t **thdata)
-{
-    *exdata = EC_KEY_get_ex_data(ec_key, get_ecdsa_exdata_idx());
-    if (*exdata == NULL) {
-        errno = 0;
-        dief("invalid internal ref");
-    }
-    *thdata = get_thread_data((*exdata)->nb);
-}
-
-static int ecdsa_sign_proxy(int type, const unsigned char *m, int m_len, unsigned char *_sigret, unsigned int *_siglen,
-                            const BIGNUM *kinv, const BIGNUM *rp, EC_KEY *ec_key)
-{
-    struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
-    neverbleed_iobuf_t buf = {NULL};
-    size_t ret, siglen;
-    unsigned char *sigret;
-
-    ecdsa_get_privsep_data(ec_key, &exdata, &thdata);
-
-    /* as far as I've tested so far, kinv and rp are always NULL.
-       Looks like setup_sign will precompute this, but it is only
-       called sign_sig, and it seems to be not used in TLS ECDSA */
-    if (kinv != NULL || rp != NULL) {
-        errno = 0;
-        dief("unexpected non-NULL kinv and rp");
-    }
-
-    iobuf_push_str(&buf, "ecdsa_sign");
-    iobuf_push_num(&buf, type);
-    iobuf_push_bytes(&buf, m, m_len);
-    iobuf_push_num(&buf, exdata->key_index);
-    iobuf_transaction(&buf, thdata);
-
-    if (iobuf_shift_num(&buf, &ret) != 0 || (sigret = iobuf_shift_bytes(&buf, &siglen)) == NULL) {
-        errno = 0;
-        dief("failed to parse response");
-    }
-    memcpy(_sigret, sigret, siglen);
-    *_siglen = (unsigned)siglen;
-    iobuf_dispose(&buf);
-
-    return (int)ret;
-}
-
-#endif /* !NEVERBLEED_PROVIDER */
-
 static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve_name, const void *pubkey, size_t pubkey_len)
 {
-#ifdef NEVERBLEED_PROVIDER
+    (void)nb;
+
     EVP_PKEY *pkey = NULL;
     OSSL_PARAM_BLD *bld = NULL;
     OSSL_PARAM *params = NULL;
@@ -2314,48 +2078,6 @@ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve
     OSSL_PARAM_free(params);
     OSSL_PARAM_BLD_free(bld);
     return pkey;
-#else
-    struct st_neverbleed_rsa_exdata_t *exdata;
-    EC_KEY *ec_key;
-    EC_GROUP *ec_group;
-    EC_POINT *ec_pubkey;
-    EVP_PKEY *pkey;
-
-    if ((exdata = malloc(sizeof(*exdata))) == NULL) {
-        fprintf(stderr, "no memory\n");
-        abort();
-    }
-    exdata->nb = nb;
-    exdata->key_index = key_index;
-
-    ec_key = EC_KEY_new_method(nb->engine);
-    EC_KEY_set_ex_data(ec_key, get_ecdsa_exdata_idx(), exdata);
-
-    ec_group = EC_GROUP_new_by_curve_name(curve_name);
-    if (!ec_group) {
-        fprintf(stderr, "could not create EC_GROUP\n");
-        abort();
-    }
-
-    EC_KEY_set_group(ec_key, ec_group);
-
-    ec_pubkey = EC_POINT_new(ec_group);
-    assert(ec_pubkey != NULL);
-    if (!EC_POINT_oct2point(ec_group, ec_pubkey, pubkey, pubkey_len, NULL)) {
-        fprintf(stderr, "failed to get ECDSA ephemeral public key from BIGNUM\n");
-        abort();
-    }
-    EC_KEY_set_public_key(ec_key, ec_pubkey);
-
-    pkey = EVP_PKEY_new();
-    EVP_PKEY_set1_EC_KEY(pkey, ec_key);
-
-    EC_POINT_free(ec_pubkey);
-    EC_GROUP_free(ec_group);
-    EC_KEY_free(ec_key);
-
-    return pkey;
-#endif /* NEVERBLEED_PROVIDER */
 }
 
 #endif
@@ -2567,36 +2289,18 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const 
     /* obtain reference */
     switch (EVP_PKEY_base_id(pkey)) {
     case EVP_PKEY_RSA: {
-#ifdef NEVERBLEED_PROVIDER
         OSSL_PARAM get_params[] = {OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, &key_index), OSSL_PARAM_END};
         if (!EVP_PKEY_get_params(pkey, get_params))
             dief("failed to get key_index from provider key");
         nb_ref = nb_provider_global_nb;
-#else
-        struct st_neverbleed_rsa_exdata_t *exdata;
-        struct st_neverbleed_thread_data_t *thdata;
-        RSA *rsa = EVP_PKEY_get1_RSA(pkey);
-        get_privsep_data(rsa, &exdata, &thdata);
-        RSA_free(rsa);
-        key_index = exdata->key_index;
-        nb_ref = exdata->nb;
-#endif
         cmd = "digestsign-rsa";
     } break;
 #ifdef NEVERBLEED_ECDSA
     case EVP_PKEY_EC: {
-#ifdef NEVERBLEED_PROVIDER
         OSSL_PARAM get_params[] = {OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, &key_index), OSSL_PARAM_END};
         if (!EVP_PKEY_get_params(pkey, get_params))
             dief("failed to get key_index from provider key");
         nb_ref = nb_provider_global_nb;
-#else
-        struct st_neverbleed_rsa_exdata_t *exdata;
-        struct st_neverbleed_thread_data_t *thdata;
-        ecdsa_get_privsep_data(EVP_PKEY_get0_EC_KEY(pkey), &exdata, &thdata);
-        key_index = exdata->key_index;
-        nb_ref = exdata->nb;
-#endif
     } break;
 #endif
     default:
@@ -2687,23 +2391,11 @@ void neverbleed_start_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const voi
 {
     size_t key_index;
 
-#ifdef NEVERBLEED_PROVIDER
     {
         OSSL_PARAM get_params[] = {OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, &key_index), OSSL_PARAM_END};
         if (!EVP_PKEY_get_params(pkey, get_params))
             dief("failed to get key_index from provider key");
     }
-#else
-    {
-        struct st_neverbleed_rsa_exdata_t *exdata;
-        struct st_neverbleed_thread_data_t *thdata;
-        RSA *rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
-        assert(rsa != NULL);
-        get_privsep_data(rsa, &exdata, &thdata);
-        RSA_free(rsa);
-        key_index = exdata->key_index;
-    }
-#endif
 
     *buf = (neverbleed_iobuf_t){NULL};
     iobuf_push_str(buf, "decrypt");
@@ -3425,27 +3117,6 @@ static void set_signal_handler(int signo, void (*cb)(int signo))
     sigaction(signo, &action, NULL);
 }
 
-#if !defined(NEVERBLEED_OPAQUE_RSA_METHOD) && !defined(NEVERBLEED_PROVIDER)
-
-static RSA_METHOD static_rsa_method = {
-    "privsep RSA method", /* name */
-    NULL,                 /* rsa_pub_enc */
-    NULL,                 /* rsa_pub_dec */
-    priv_enc_proxy,       /* rsa_priv_enc */
-    priv_dec_proxy,       /* rsa_priv_dec */
-    NULL,                 /* rsa_mod_exp */
-    NULL,                 /* bn_mod_exp */
-    NULL,                 /* init */
-    NULL,                 /* finish */
-    RSA_FLAG_SIGN_VER,    /* flags */
-    NULL,                 /* app data */
-    sign_proxy,           /* rsa_sign */
-    NULL,                 /* rsa_verify */
-    NULL                  /* rsa_keygen */
-};
-
-#endif
-
 int neverbleed_init(neverbleed_t *nb, char *errbuf)
 {
     int pipe_fds[2] = {-1, -1}, listen_fd = -1;
@@ -3514,8 +3185,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     pipe_fds[0] = -1;
 
 #if defined(OPENSSL_IS_BORINGSSL)
-    /* no engine for BoringSSL */
-#elif defined(NEVERBLEED_PROVIDER)
+    /* no engine/provider for BoringSSL */
+#else
     { /* setup provider for RSA and ECDSA */
         nb_provider_global_nb = nb;
         if (!OSSL_PROVIDER_add_builtin(NULL, "neverbleed", nb_provider_init)) {
@@ -3527,52 +3198,6 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
             snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "OSSL_PROVIDER_load failed");
             goto Fail;
         }
-    }
-#else
-    { /* setup engine */
-        const RSA_METHOD *rsa_default_method;
-        RSA_METHOD *rsa_method;
-#ifdef NEVERBLEED_ECDSA
-        const EC_KEY_METHOD *ecdsa_default_method;
-        EC_KEY_METHOD *ecdsa_method;
-#endif
-
-#ifdef NEVERBLEED_OPAQUE_RSA_METHOD
-        rsa_default_method = RSA_PKCS1_OpenSSL();
-        rsa_method = RSA_meth_dup(rsa_default_method);
-
-        RSA_meth_set1_name(rsa_method, "privsep RSA method");
-        RSA_meth_set_priv_enc(rsa_method, priv_enc_proxy);
-        RSA_meth_set_priv_dec(rsa_method, priv_dec_proxy);
-        RSA_meth_set_sign(rsa_method, sign_proxy);
-#else
-        rsa_default_method = RSA_PKCS1_SSLeay();
-        rsa_method = &static_rsa_method;
-
-        rsa_method->rsa_pub_enc = rsa_default_method->rsa_pub_enc;
-        rsa_method->rsa_pub_dec = rsa_default_method->rsa_pub_dec;
-        rsa_method->rsa_verify = rsa_default_method->rsa_verify;
-        rsa_method->bn_mod_exp = rsa_default_method->bn_mod_exp;
-#endif
-
-#ifdef NEVERBLEED_ECDSA
-        ecdsa_default_method = EC_KEY_get_default_method();
-        ecdsa_method = EC_KEY_METHOD_new(ecdsa_default_method);
-
-        /* it seems sign_sig and sign_setup is not used in TLS ECDSA. */
-        EC_KEY_METHOD_set_sign(ecdsa_method, ecdsa_sign_proxy, NULL, NULL);
-#endif
-
-        if ((nb->engine = ENGINE_new()) == NULL || !ENGINE_set_id(nb->engine, "neverbleed") ||
-            !ENGINE_set_name(nb->engine, "privilege separation software engine") || !ENGINE_set_RSA(nb->engine, rsa_method)
-#ifdef NEVERBLEED_ECDSA
-            || !ENGINE_set_EC(nb->engine, ecdsa_method)
-#endif
-        ) {
-            snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "failed to initialize the OpenSSL engine");
-            goto Fail;
-        }
-        ENGINE_add(nb->engine);
     }
 #endif
 
@@ -3592,10 +3217,10 @@ Fail:
     }
     if (listen_fd != -1)
         close(listen_fd);
-#if !defined(OPENSSL_IS_BORINGSSL)
-    if (nb->engine != NULL) {
-        ENGINE_free(nb->engine);
-        nb->engine = NULL;
+#if !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER)
+    if (nb->provider != NULL) {
+        OSSL_PROVIDER_unload(nb->provider);
+        nb->provider = NULL;
     }
 #endif
     return -1;
