@@ -1373,6 +1373,437 @@ static const OSSL_DISPATCH nb_sig_functions[] = {
     {0, NULL},
 };
 
+/* --- EC KEYMGMT --- */
+
+struct nb_ec_keydata {
+    neverbleed_t *nb;
+    size_t key_index;
+    int curve_nid;
+    unsigned char *pub_bytes;
+    size_t pub_len;
+    int has_private;
+};
+
+static void *nb_ec_keymgmt_new(void *provctx)
+{
+    struct nb_ec_keydata *key = OPENSSL_zalloc(sizeof(*key));
+    if (key == NULL)
+        return NULL;
+    key->nb = ((struct nb_provider_ctx *)provctx)->nb;
+    key->key_index = SIZE_MAX;
+    return key;
+}
+
+static void nb_ec_keymgmt_free(void *keydata)
+{
+    struct nb_ec_keydata *key = keydata;
+    if (key == NULL)
+        return;
+    if (key->has_private && key->key_index != SIZE_MAX) {
+        struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
+        neverbleed_iobuf_t buf = {NULL};
+        iobuf_push_str(&buf, "del_pkey");
+        iobuf_push_num(&buf, key->key_index);
+        iobuf_transaction(&buf, thdata);
+        iobuf_dispose(&buf);
+    }
+    OPENSSL_free(key->pub_bytes);
+    OPENSSL_free(key);
+}
+
+static int nb_ec_keymgmt_has(const void *keydata, int selection)
+{
+    const struct nb_ec_keydata *key = keydata;
+    if (key == NULL)
+        return 0;
+    if ((selection & OSSL_KEYMGMT_SELECT_PUBLIC_KEY) && key->pub_bytes == NULL)
+        return 0;
+    if ((selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY) && !key->has_private)
+        return 0;
+    if ((selection & OSSL_KEYMGMT_SELECT_DOMAIN_PARAMETERS) && key->curve_nid == 0)
+        return 0;
+    return 1;
+}
+
+static int nb_ec_keymgmt_import(void *keydata, int selection, const OSSL_PARAM params[])
+{
+    struct nb_ec_keydata *key = keydata;
+    const OSSL_PARAM *p;
+
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_GROUP_NAME)) != NULL) {
+        char name[64] = "";
+        OSSL_PARAM_get_utf8_string(p, (char **)&(char *){name}, sizeof(name));
+        key->curve_nid = OBJ_txt2nid(name);
+    }
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_PUB_KEY)) != NULL) {
+        OPENSSL_free(key->pub_bytes);
+        key->pub_bytes = NULL;
+        key->pub_len = p->data_size;
+        if (key->pub_len > 0) {
+            key->pub_bytes = OPENSSL_memdup(p->data, key->pub_len);
+        }
+    }
+    if ((p = OSSL_PARAM_locate_const(params, NEVERBLEED_PARAM_KEY_INDEX)) != NULL) {
+        OSSL_PARAM_get_size_t(p, &key->key_index);
+        key->has_private = 1;
+    }
+    return 1;
+}
+
+static const OSSL_PARAM *nb_ec_keymgmt_import_types(int selection)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, NULL, 0),
+        OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_PUB_KEY, NULL, 0),
+        OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, NULL),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static int nb_ec_keymgmt_get_params(void *keydata, OSSL_PARAM params[])
+{
+    struct nb_ec_keydata *key = keydata;
+    OSSL_PARAM *p;
+    int bits = 0;
+
+    if (key->curve_nid != 0) {
+        EC_GROUP *group = EC_GROUP_new_by_curve_name(key->curve_nid);
+        if (group != NULL) {
+            bits = EC_GROUP_get_degree(group);
+            EC_GROUP_free(group);
+        }
+    }
+
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_BITS)) != NULL)
+        OSSL_PARAM_set_int(p, bits);
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_SECURITY_BITS)) != NULL)
+        OSSL_PARAM_set_int(p, bits / 2);
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_MAX_SIZE)) != NULL) {
+        /* max DER-encoded ECDSA signature size: each integer is at most order_size+1 bytes, plus DER overhead */
+        int order_bytes = (bits + 7) / 8;
+        OSSL_PARAM_set_int(p, 2 * (order_bytes + 1) + 6);
+    }
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_GROUP_NAME)) != NULL) {
+        const char *name = key->curve_nid != 0 ? OBJ_nid2sn(key->curve_nid) : "";
+        OSSL_PARAM_set_utf8_string(p, name);
+    }
+    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_PUB_KEY)) != NULL && key->pub_bytes != NULL) {
+        OSSL_PARAM_set_octet_string(p, key->pub_bytes, key->pub_len);
+    }
+    if ((p = OSSL_PARAM_locate(params, NEVERBLEED_PARAM_KEY_INDEX)) != NULL)
+        OSSL_PARAM_set_size_t(p, key->key_index);
+    return 1;
+}
+
+static const OSSL_PARAM *nb_ec_keymgmt_gettable_params(void *provctx)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_int(OSSL_PKEY_PARAM_BITS, NULL),
+        OSSL_PARAM_int(OSSL_PKEY_PARAM_SECURITY_BITS, NULL),
+        OSSL_PARAM_int(OSSL_PKEY_PARAM_MAX_SIZE, NULL),
+        OSSL_PARAM_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, NULL, 0),
+        OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_PUB_KEY, NULL, 0),
+        OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, NULL),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static int nb_ec_keymgmt_export(void *keydata, int selection, OSSL_CALLBACK *param_cb, void *cbarg)
+{
+    struct nb_ec_keydata *key = keydata;
+    if (selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY)
+        return 0;
+    OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+    if (bld == NULL)
+        return 0;
+    if (key->curve_nid != 0)
+        OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, OBJ_nid2sn(key->curve_nid), 0);
+    if (key->pub_bytes != NULL)
+        OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, key->pub_bytes, key->pub_len);
+    OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+    OSSL_PARAM_BLD_free(bld);
+    if (params == NULL)
+        return 0;
+    int ret = param_cb(params, cbarg);
+    OSSL_PARAM_free(params);
+    return ret;
+}
+
+static const OSSL_PARAM *nb_ec_keymgmt_export_types(int selection)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, NULL, 0),
+        OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_PUB_KEY, NULL, 0),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static const char *nb_ec_keymgmt_query_operation_name(int operation_id)
+{
+    switch (operation_id) {
+    case OSSL_OP_SIGNATURE:
+        return "ECDSA";
+    }
+    return NULL;
+}
+
+static const OSSL_DISPATCH nb_ec_keymgmt_functions[] = {
+    {OSSL_FUNC_KEYMGMT_NEW, (void (*)(void))nb_ec_keymgmt_new},
+    {OSSL_FUNC_KEYMGMT_FREE, (void (*)(void))nb_ec_keymgmt_free},
+    {OSSL_FUNC_KEYMGMT_HAS, (void (*)(void))nb_ec_keymgmt_has},
+    {OSSL_FUNC_KEYMGMT_IMPORT, (void (*)(void))nb_ec_keymgmt_import},
+    {OSSL_FUNC_KEYMGMT_IMPORT_TYPES, (void (*)(void))nb_ec_keymgmt_import_types},
+    {OSSL_FUNC_KEYMGMT_GET_PARAMS, (void (*)(void))nb_ec_keymgmt_get_params},
+    {OSSL_FUNC_KEYMGMT_GETTABLE_PARAMS, (void (*)(void))nb_ec_keymgmt_gettable_params},
+    {OSSL_FUNC_KEYMGMT_EXPORT, (void (*)(void))nb_ec_keymgmt_export},
+    {OSSL_FUNC_KEYMGMT_EXPORT_TYPES, (void (*)(void))nb_ec_keymgmt_export_types},
+    {OSSL_FUNC_KEYMGMT_QUERY_OPERATION_NAME, (void (*)(void))nb_ec_keymgmt_query_operation_name},
+    {0, NULL},
+};
+
+/* --- EC SIGNATURE --- */
+
+struct nb_ec_sig_ctx {
+    struct nb_provider_ctx *provctx;
+    struct nb_ec_keydata *keydata;
+    unsigned char *tbsdata;
+    size_t tbslen, tbscap;
+    int md_nid;
+};
+
+static void *nb_ec_sig_newctx(void *provctx, const char *propq)
+{
+    struct nb_ec_sig_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
+    if (ctx == NULL)
+        return NULL;
+    ctx->provctx = provctx;
+    ctx->md_nid = NID_undef;
+    return ctx;
+}
+
+static void nb_ec_sig_freectx(void *vctx)
+{
+    struct nb_ec_sig_ctx *ctx = vctx;
+    OPENSSL_free(ctx->tbsdata);
+    OPENSSL_free(ctx);
+}
+
+static int nb_ec_sig_sign_init(void *vctx, void *vkey, const OSSL_PARAM params[])
+{
+    struct nb_ec_sig_ctx *ctx = vctx;
+    ctx->keydata = vkey;
+    return 1;
+}
+
+static int nb_ec_sig_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs,
+                          size_t tbslen)
+{
+    struct nb_ec_sig_ctx *ctx = vctx;
+    struct nb_ec_keydata *key = ctx->keydata;
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
+
+    /* size query */
+    if (sig == NULL) {
+        int bits = 0;
+        if (key->curve_nid != 0) {
+            EC_GROUP *group = EC_GROUP_new_by_curve_name(key->curve_nid);
+            if (group != NULL) {
+                bits = EC_GROUP_get_degree(group);
+                EC_GROUP_free(group);
+            }
+        }
+        int order_bytes = (bits + 7) / 8;
+        *siglen = 2 * (order_bytes + 1) + 6;
+        return 1;
+    }
+
+    /* send "ecdsa_sign" to daemon: type=0, tbs, key_index */
+    neverbleed_iobuf_t buf = {NULL};
+    iobuf_push_str(&buf, "ecdsa_sign");
+    iobuf_push_num(&buf, 0); /* type (unused but required by protocol) */
+    iobuf_push_bytes(&buf, tbs, tbslen);
+    iobuf_push_num(&buf, key->key_index);
+    iobuf_transaction(&buf, thdata);
+
+    size_t ret;
+    unsigned char *sigret;
+    size_t sigret_len;
+    if (iobuf_shift_num(&buf, &ret) != 0 || (sigret = iobuf_shift_bytes(&buf, &sigret_len)) == NULL) {
+        iobuf_dispose(&buf);
+        return 0;
+    }
+    if ((int)ret != 1 || sigret_len > sigsize) {
+        iobuf_dispose(&buf);
+        return 0;
+    }
+    memcpy(sig, sigret, sigret_len);
+    *siglen = sigret_len;
+    iobuf_dispose(&buf);
+    return 1;
+}
+
+static int nb_ec_sig_digest_sign_init(void *vctx, const char *mdname, void *vkey, const OSSL_PARAM params[])
+{
+    struct nb_ec_sig_ctx *ctx = vctx;
+    ctx->keydata = vkey;
+    if (mdname != NULL) {
+        const EVP_MD *md = EVP_get_digestbyname(mdname);
+        ctx->md_nid = md != NULL ? EVP_MD_type(md) : NID_undef;
+    }
+    ctx->tbslen = 0;
+    return 1;
+}
+
+static int nb_ec_sig_digest_sign_update(void *vctx, const unsigned char *data, size_t datalen)
+{
+    struct nb_ec_sig_ctx *ctx = vctx;
+    if (ctx->tbslen + datalen > ctx->tbscap) {
+        size_t newcap = ctx->tbslen + datalen;
+        if (newcap < 256)
+            newcap = 256;
+        ctx->tbsdata = OPENSSL_realloc(ctx->tbsdata, newcap);
+        if (ctx->tbsdata == NULL)
+            return 0;
+        ctx->tbscap = newcap;
+    }
+    memcpy(ctx->tbsdata + ctx->tbslen, data, datalen);
+    ctx->tbslen += datalen;
+    return 1;
+}
+
+static int nb_ec_sig_digest_sign_final(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize)
+{
+    struct nb_ec_sig_ctx *ctx = vctx;
+    struct nb_ec_keydata *key = ctx->keydata;
+    struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
+
+    if (sig == NULL) {
+        int bits = 0;
+        if (key->curve_nid != 0) {
+            EC_GROUP *group = EC_GROUP_new_by_curve_name(key->curve_nid);
+            if (group != NULL) {
+                bits = EC_GROUP_get_degree(group);
+                EC_GROUP_free(group);
+            }
+        }
+        int order_bytes = (bits + 7) / 8;
+        *siglen = 2 * (order_bytes + 1) + 6;
+        return 1;
+    }
+
+    /* send "digestsign" to daemon */
+    neverbleed_iobuf_t buf = {NULL};
+    iobuf_push_str(&buf, "digestsign");
+    iobuf_push_num(&buf, key->key_index);
+    iobuf_push_num(&buf, (size_t)ctx->md_nid);
+    iobuf_push_bytes(&buf, ctx->tbsdata, ctx->tbslen);
+    iobuf_push_num(&buf, 0); /* rsa_pss = 0 */
+    iobuf_transaction(&buf, thdata);
+
+    size_t result_len;
+    unsigned char *result;
+    if ((result = iobuf_shift_bytes(&buf, &result_len)) == NULL || result_len == 0) {
+        iobuf_dispose(&buf);
+        return 0;
+    }
+    if (result_len > sigsize) {
+        iobuf_dispose(&buf);
+        return 0;
+    }
+    memcpy(sig, result, result_len);
+    *siglen = result_len;
+    iobuf_dispose(&buf);
+    return 1;
+}
+
+static int nb_ec_sig_digest_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs,
+                                 size_t tbslen)
+{
+    struct nb_ec_sig_ctx *ctx = vctx;
+    if (sig == NULL) {
+        struct nb_ec_keydata *key = ctx->keydata;
+        int bits = 0;
+        if (key->curve_nid != 0) {
+            EC_GROUP *group = EC_GROUP_new_by_curve_name(key->curve_nid);
+            if (group != NULL) {
+                bits = EC_GROUP_get_degree(group);
+                EC_GROUP_free(group);
+            }
+        }
+        int order_bytes = (bits + 7) / 8;
+        *siglen = 2 * (order_bytes + 1) + 6;
+        return 1;
+    }
+    if (!nb_ec_sig_digest_sign_update(vctx, tbs, tbslen))
+        return 0;
+    return nb_ec_sig_digest_sign_final(vctx, sig, siglen, sigsize);
+}
+
+static int nb_ec_sig_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+{
+    struct nb_ec_sig_ctx *ctx = vctx;
+    const OSSL_PARAM *p;
+
+    if ((p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_DIGEST)) != NULL) {
+        char mdname[64] = "";
+        OSSL_PARAM_get_utf8_string(p, (char **)&(char *){mdname}, sizeof(mdname));
+        const EVP_MD *md = EVP_get_digestbyname(mdname);
+        if (md != NULL)
+            ctx->md_nid = EVP_MD_type(md);
+    }
+    return 1;
+}
+
+static const OSSL_PARAM *nb_ec_sig_settable_ctx_params(void *vctx, void *provctx)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_DIGEST, NULL, 0),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static int nb_ec_sig_get_ctx_params(void *vctx, OSSL_PARAM params[])
+{
+    struct nb_ec_sig_ctx *ctx = vctx;
+    OSSL_PARAM *p;
+
+    if ((p = OSSL_PARAM_locate(params, OSSL_SIGNATURE_PARAM_DIGEST)) != NULL) {
+        const char *name = ctx->md_nid != NID_undef ? OBJ_nid2sn(ctx->md_nid) : "";
+        if (!OSSL_PARAM_set_utf8_string(p, name))
+            return 0;
+    }
+    return 1;
+}
+
+static const OSSL_PARAM *nb_ec_sig_gettable_ctx_params(void *vctx, void *provctx)
+{
+    static const OSSL_PARAM types[] = {
+        OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_DIGEST, NULL, 0),
+        OSSL_PARAM_END,
+    };
+    return types;
+}
+
+static const OSSL_DISPATCH nb_ec_sig_functions[] = {
+    {OSSL_FUNC_SIGNATURE_NEWCTX, (void (*)(void))nb_ec_sig_newctx},
+    {OSSL_FUNC_SIGNATURE_FREECTX, (void (*)(void))nb_ec_sig_freectx},
+    {OSSL_FUNC_SIGNATURE_SIGN_INIT, (void (*)(void))nb_ec_sig_sign_init},
+    {OSSL_FUNC_SIGNATURE_SIGN, (void (*)(void))nb_ec_sig_sign},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT, (void (*)(void))nb_ec_sig_digest_sign_init},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE, (void (*)(void))nb_ec_sig_digest_sign_update},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_FINAL, (void (*)(void))nb_ec_sig_digest_sign_final},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN, (void (*)(void))nb_ec_sig_digest_sign},
+    {OSSL_FUNC_SIGNATURE_SET_CTX_PARAMS, (void (*)(void))nb_ec_sig_set_ctx_params},
+    {OSSL_FUNC_SIGNATURE_SETTABLE_CTX_PARAMS, (void (*)(void))nb_ec_sig_settable_ctx_params},
+    {OSSL_FUNC_SIGNATURE_GET_CTX_PARAMS, (void (*)(void))nb_ec_sig_get_ctx_params},
+    {OSSL_FUNC_SIGNATURE_GETTABLE_CTX_PARAMS, (void (*)(void))nb_ec_sig_gettable_ctx_params},
+    {0, NULL},
+};
+
 /* --- ASYM_CIPHER --- */
 
 static void *nb_asym_cipher_newctx(void *provctx)
@@ -1613,11 +2044,13 @@ static const OSSL_DISPATCH nb_asym_cipher_functions[] = {
 
 static const OSSL_ALGORITHM nb_keymgmts[] = {
     {"RSA", "provider=neverbleed", nb_keymgmt_functions, "Neverbleed RSA KEYMGMT"},
+    {"EC", "provider=neverbleed", nb_ec_keymgmt_functions, "Neverbleed EC KEYMGMT"},
     {NULL, NULL, NULL, NULL},
 };
 
 static const OSSL_ALGORITHM nb_signatures[] = {
     {"RSA", "provider=neverbleed", nb_sig_functions, "Neverbleed RSA Signature"},
+    {"ECDSA", "provider=neverbleed", nb_ec_sig_functions, "Neverbleed ECDSA Signature"},
     {NULL, NULL, NULL, NULL},
 };
 
@@ -1783,6 +2216,8 @@ static int ecdsa_sign_stub(neverbleed_iobuf_t *buf)
     return 0;
 }
 
+#if !defined(NEVERBLEED_PROVIDER)
+
 static int get_ecdsa_exdata_idx(void);
 static void ecdsa_exdata_free_callback(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
 {
@@ -1846,8 +2281,40 @@ static int ecdsa_sign_proxy(int type, const unsigned char *m, int m_len, unsigne
     return (int)ret;
 }
 
+#endif /* !NEVERBLEED_PROVIDER */
+
 static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve_name, const void *pubkey, size_t pubkey_len)
 {
+#ifdef NEVERBLEED_PROVIDER
+    EVP_PKEY *pkey = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    OSSL_PARAM *params = NULL;
+    EVP_PKEY_CTX *pctx = NULL;
+    const char *curve_sn = OBJ_nid2sn(curve_name);
+
+    if (curve_sn == NULL)
+        dief("unknown curve NID: %d", curve_name);
+
+    if ((bld = OSSL_PARAM_BLD_new()) == NULL)
+        dief("no memory");
+    OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, curve_sn, 0);
+    OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, pubkey, pubkey_len);
+    OSSL_PARAM_BLD_push_size_t(bld, NEVERBLEED_PARAM_KEY_INDEX, key_index);
+    if ((params = OSSL_PARAM_BLD_to_param(bld)) == NULL)
+        dief("OSSL_PARAM_BLD_to_param failed");
+
+    if ((pctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", "provider=neverbleed")) == NULL)
+        dief("EVP_PKEY_CTX_new_from_name failed");
+    if (EVP_PKEY_fromdata_init(pctx) <= 0)
+        dief("EVP_PKEY_fromdata_init failed");
+    if (EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEYPAIR, params) <= 0)
+        dief("EVP_PKEY_fromdata failed");
+
+    EVP_PKEY_CTX_free(pctx);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    return pkey;
+#else
     struct st_neverbleed_rsa_exdata_t *exdata;
     EC_KEY *ec_key;
     EC_GROUP *ec_group;
@@ -1888,6 +2355,7 @@ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve
     EC_KEY_free(ec_key);
 
     return pkey;
+#endif /* NEVERBLEED_PROVIDER */
 }
 
 #endif
@@ -2117,11 +2585,18 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const 
     } break;
 #ifdef NEVERBLEED_ECDSA
     case EVP_PKEY_EC: {
+#ifdef NEVERBLEED_PROVIDER
+        OSSL_PARAM get_params[] = {OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, &key_index), OSSL_PARAM_END};
+        if (!EVP_PKEY_get_params(pkey, get_params))
+            dief("failed to get key_index from provider key");
+        nb_ref = nb_provider_global_nb;
+#else
         struct st_neverbleed_rsa_exdata_t *exdata;
         struct st_neverbleed_thread_data_t *thdata;
         ecdsa_get_privsep_data(EVP_PKEY_get0_EC_KEY(pkey), &exdata, &thdata);
         key_index = exdata->key_index;
         nb_ref = exdata->nb;
+#endif
     } break;
 #endif
     default:
@@ -3041,7 +3516,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
 #if defined(OPENSSL_IS_BORINGSSL)
     /* no engine for BoringSSL */
 #elif defined(NEVERBLEED_PROVIDER)
-    { /* setup provider for RSA, engine for ECDSA only */
+    { /* setup provider for RSA and ECDSA */
         nb_provider_global_nb = nb;
         if (!OSSL_PROVIDER_add_builtin(NULL, "neverbleed", nb_provider_init)) {
             snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "OSSL_PROVIDER_add_builtin failed");
@@ -3052,21 +3527,6 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
             snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "OSSL_PROVIDER_load failed");
             goto Fail;
         }
-#ifdef NEVERBLEED_ECDSA
-        { /* ECDSA-only ENGINE */
-            const EC_KEY_METHOD *ecdsa_default_method = EC_KEY_get_default_method();
-            EC_KEY_METHOD *ecdsa_method = EC_KEY_METHOD_new(ecdsa_default_method);
-            EC_KEY_METHOD_set_sign(ecdsa_method, ecdsa_sign_proxy, NULL, NULL);
-
-            if ((nb->engine = ENGINE_new()) == NULL || !ENGINE_set_id(nb->engine, "neverbleed") ||
-                !ENGINE_set_name(nb->engine, "privilege separation software engine") ||
-                !ENGINE_set_EC(nb->engine, ecdsa_method)) {
-                snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "failed to initialize the OpenSSL engine for ECDSA");
-                goto Fail;
-            }
-            ENGINE_add(nb->engine);
-        }
-#endif
     }
 #else
     { /* setup engine */
