@@ -611,6 +611,8 @@ static int send_responses(int cleanup)
     return result;
 }
 
+static EVP_PKEY *daemon_get_pkey(size_t key_index);
+
 static RSA *daemon_get_rsa(size_t key_index)
 {
     RSA *rsa = NULL;
@@ -702,7 +704,67 @@ static int priv_enc_stub(neverbleed_iobuf_t *buf)
 
 static int priv_dec_stub(neverbleed_iobuf_t *buf)
 {
-    return priv_encdec_stub(__FUNCTION__, RSA_private_decrypt, buf);
+    unsigned char *from;
+    size_t flen, key_index, padding;
+
+    if ((from = iobuf_shift_bytes(buf, &flen)) == NULL || iobuf_shift_num(buf, &key_index) != 0 ||
+        iobuf_shift_num(buf, &padding) != 0) {
+        errno = 0;
+        warnf("%s: failed to parse request", __FUNCTION__);
+        return -1;
+    }
+
+    if (padding == RSA_PKCS1_WITH_TLS_PADDING) {
+        /* TLS RSA key exchange: delegate to EVP_PKEY_decrypt which handles CT padding check and Bleichenbacher countermeasure.
+         * The raw RSA operation goes through RSA_private_decrypt internally, so QAT ENGINE is used if available. */
+        size_t tls_client_version;
+        if (iobuf_shift_num(buf, &tls_client_version) != 0) {
+            errno = 0;
+            warnf("%s: failed to parse tls_client_version", __FUNCTION__);
+            return -1;
+        }
+        EVP_PKEY *pkey = daemon_get_pkey(key_index);
+        if (pkey == NULL) {
+            errno = 0;
+            warnf("%s: invalid key index:%zu", __FUNCTION__, key_index);
+            return -1;
+        }
+        unsigned char out[SSL_MAX_MASTER_KEY_LENGTH];
+        size_t outlen = sizeof(out);
+        EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
+        int ok = 0;
+        if (ctx != NULL && EVP_PKEY_decrypt_init(ctx) > 0 &&
+            EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_WITH_TLS_PADDING) > 0) {
+            OSSL_PARAM params[3], *p = params;
+            *p++ = OSSL_PARAM_construct_uint(OSSL_ASYM_CIPHER_PARAM_TLS_CLIENT_VERSION,
+                                             (unsigned int *)&tls_client_version);
+            *p++ = OSSL_PARAM_construct_end();
+            if (EVP_PKEY_CTX_set_params(ctx, params) > 0 &&
+                EVP_PKEY_decrypt(ctx, out, &outlen, from, flen) > 0)
+                ok = 1;
+        }
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        iobuf_dispose(buf);
+        iobuf_push_num(buf, ok ? (size_t)outlen : 0);
+        iobuf_push_bytes(buf, out, ok ? outlen : 0);
+        return 0;
+    }
+
+    /* other padding modes: use RSA_private_decrypt directly */
+    RSA *rsa = daemon_get_rsa(key_index);
+    if (rsa == NULL) {
+        errno = 0;
+        warnf("%s: invalid key index:%zu", __FUNCTION__, key_index);
+        return -1;
+    }
+    unsigned char to[4096];
+    int ret = RSA_private_decrypt((int)flen, from, to, rsa, (int)padding);
+    iobuf_dispose(buf);
+    RSA_free(rsa);
+    iobuf_push_num(buf, ret);
+    iobuf_push_bytes(buf, to, ret > 0 ? ret : 0);
+    return 0;
 }
 
 static int sign_stub(neverbleed_iobuf_t *buf)
@@ -771,30 +833,6 @@ struct asym_cipher_ctx {
     unsigned int tls_client_version;
     unsigned int tls_negotiated_version;
 };
-
-/* --- constant-time helpers for TLS padding check (all return 0 or 0xFFFFFFFF masks) --- */
-
-static inline unsigned int ct_is_zero_mask(unsigned int x)
-{
-    /* returns 0xFFFFFFFF if x == 0, 0 otherwise */
-    return 0u - (1u ^ ((x | (0u - x)) >> (sizeof(unsigned int) * 8 - 1)));
-}
-
-static inline unsigned int ct_eq_mask(unsigned int a, unsigned int b)
-{
-    return ct_is_zero_mask(a ^ b);
-}
-
-static inline unsigned char ct_select_8(unsigned int mask, unsigned char a, unsigned char b)
-{
-    return (unsigned char)((mask & a) | (~mask & b));
-}
-
-static inline unsigned int ct_ge_mask(unsigned int a, unsigned int b)
-{
-    /* returns 0xFFFFFFFF if a >= b, 0 otherwise (a, b must be < 2^31) */
-    return 0u - (1u & ~((a - b) >> (sizeof(unsigned int) * 8 - 1)));
-}
 
 /* --- KEYMGMT --- */
 
@@ -1687,80 +1725,30 @@ static int asym_cipher_decrypt(void *vctx, unsigned char *out, size_t *outlen, s
         iobuf_dispose(&buf);
         return 1;
     } else if (ctx->padding == RSA_PKCS1_WITH_TLS_PADDING) {
-        /* Raw decrypt then constant-time PKCS1 type 2 TLS unpadding */
+        /* TLS RSA key exchange: delegate to daemon which uses EVP_PKEY_decrypt(RSA_PKCS1_WITH_TLS_PADDING) for CT padding check
+         * and Bleichenbacher countermeasure */
         neverbleed_iobuf_t buf = {NULL};
-        iobuf_push_str(&buf, "decrypt");
-        iobuf_push_num(&buf, key->key_index);
+        iobuf_push_str(&buf, "priv_dec");
         iobuf_push_bytes(&buf, in, inlen);
+        iobuf_push_num(&buf, key->key_index);
+        iobuf_push_num(&buf, (size_t)RSA_PKCS1_WITH_TLS_PADDING);
+        iobuf_push_num(&buf, (size_t)ctx->tls_client_version);
         iobuf_transaction(&buf, thdata);
 
-        size_t declen;
+        size_t ret;
         unsigned char *dec;
-        if ((dec = iobuf_shift_bytes(&buf, &declen)) == NULL || declen == 0) {
+        size_t declen;
+        if (iobuf_shift_num(&buf, &ret) != 0 || (dec = iobuf_shift_bytes(&buf, &declen)) == NULL) {
             iobuf_dispose(&buf);
-            /* Even on failure, return random PMS for Bleichenbacher countermeasure */
-            unsigned char rand_pms[SSL_MAX_MASTER_KEY_LENGTH];
-            RAND_bytes(rand_pms, sizeof(rand_pms));
-            if (sizeof(rand_pms) > outsize)
-                return 0;
-            memcpy(out, rand_pms, sizeof(rand_pms));
-            *outlen = sizeof(rand_pms);
-            return 1;
-        }
-
-        /* Constant-time PKCS1 type 2 TLS check */
-        unsigned char rand_pms[SSL_MAX_MASTER_KEY_LENGTH];
-        RAND_bytes(rand_pms, sizeof(rand_pms));
-
-        /* Check 0x00 0x02 header */
-        unsigned int good = ct_eq_mask(dec[0], 0) & ct_eq_mask(dec[1], 2);
-
-        /* Find 0x00 separator, require at least 8 bytes of padding */
-        size_t sep_idx = 0;
-        unsigned int found_sep = 0;
-        for (size_t i = 2; i < declen; i++) {
-            unsigned int is_zero = ct_eq_mask(dec[i], 0);
-            unsigned int is_first = is_zero & ~found_sep & ct_ge_mask((unsigned int)i, 10u);
-            /* ct_ge_mask(i, 10u) means i >= 10, i.e., at least 8 bytes of padding (indices 2..9) */
-            sep_idx |= is_first & (unsigned int)i;
-            found_sep |= is_first;
-        }
-        good &= found_sep;
-
-        /* PMS starts at sep_idx + 1, length should be 48 */
-        size_t pms_start = sep_idx + 1;
-        size_t pms_len = declen - pms_start;
-        good &= ct_eq_mask((unsigned int)pms_len, SSL_MAX_MASTER_KEY_LENGTH);
-
-        /* Check TLS version in first two bytes of PMS */
-        if (ctx->tls_client_version != 0) {
-            unsigned int ver_hi = ctx->tls_client_version >> 8;
-            unsigned int ver_lo = ctx->tls_client_version & 0xff;
-            /* Only check if pms_start is valid */
-            unsigned int check_ver = good;
-            if (pms_start + 1 < declen) {
-                check_ver &= ct_eq_mask(dec[pms_start], ver_hi) & ct_eq_mask(dec[pms_start + 1], ver_lo);
-            } else {
-                check_ver = 0;
-            }
-            good = check_ver;
-        }
-
-        /* Constant-time select between real PMS and random PMS */
-        unsigned char result[SSL_MAX_MASTER_KEY_LENGTH];
-        for (size_t i = 0; i < SSL_MAX_MASTER_KEY_LENGTH; i++) {
-            size_t src_idx = pms_start + i;
-            unsigned char real_byte = (src_idx < declen) ? dec[src_idx] : 0;
-            result[i] = ct_select_8(good, real_byte, rand_pms[i]);
-        }
-
-        iobuf_dispose(&buf);
-
-        if (SSL_MAX_MASTER_KEY_LENGTH > outsize)
             return 0;
-        memcpy(out, result, SSL_MAX_MASTER_KEY_LENGTH);
+        }
+        if (ret != SSL_MAX_MASTER_KEY_LENGTH || declen != SSL_MAX_MASTER_KEY_LENGTH || declen > outsize) {
+            iobuf_dispose(&buf);
+            return 0;
+        }
+        memcpy(out, dec, SSL_MAX_MASTER_KEY_LENGTH);
         *outlen = SSL_MAX_MASTER_KEY_LENGTH;
-        /* Always return success (Bleichenbacher countermeasure) */
+        iobuf_dispose(&buf);
         return 1;
     }
 
