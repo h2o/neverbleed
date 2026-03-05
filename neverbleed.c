@@ -664,43 +664,7 @@ static size_t daemon_set_pkey(EVP_PKEY *pkey)
     return index;
 }
 
-static int priv_encdec_stub(const char *name,
-                            int (*func)(int flen, const unsigned char *from, unsigned char *to, RSA *rsa, int padding),
-                            neverbleed_iobuf_t *buf)
-{
-    unsigned char *from, to[4096];
-    size_t flen;
-    size_t key_index, padding;
-    RSA *rsa;
-    int ret;
-
-    if ((from = iobuf_shift_bytes(buf, &flen)) == NULL || iobuf_shift_num(buf, &key_index) != 0 ||
-        iobuf_shift_num(buf, &padding) != 0) {
-        errno = 0;
-        warnf("%s: failed to parse request", name);
-        return -1;
-    }
-    if ((rsa = daemon_get_rsa(key_index)) == NULL) {
-        errno = 0;
-        warnf("%s: invalid key index:%zu\n", name, key_index);
-        return -1;
-    }
-    ret = func((int)flen, from, to, rsa, (int)padding);
-    iobuf_dispose(buf);
-    RSA_free(rsa);
-
-    iobuf_push_num(buf, ret);
-    iobuf_push_bytes(buf, to, ret > 0 ? ret : 0);
-
-    return 0;
-}
-
 #if !defined(OPENSSL_IS_BORINGSSL)
-
-static int priv_enc_stub(neverbleed_iobuf_t *buf)
-{
-    return priv_encdec_stub(__FUNCTION__, RSA_private_encrypt, buf);
-}
 
 static int priv_dec_stub(neverbleed_iobuf_t *buf)
 {
@@ -2872,10 +2836,7 @@ static void *daemon_conn_thread(void *_sock_fd)
             break;
         }
 #if !defined(OPENSSL_IS_BORINGSSL)
-        if (strcmp(cmd, "priv_enc") == 0) {
-            if (offload_start(priv_enc_stub, buf) != 0)
-                break;
-        } else if (strcmp(cmd, "priv_dec") == 0) {
+        if (strcmp(cmd, "priv_dec") == 0) {
             if (offload_start(priv_dec_stub, buf) != 0)
                 break;
         } else if (strcmp(cmd, "sign") == 0) {
