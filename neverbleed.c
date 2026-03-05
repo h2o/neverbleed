@@ -733,26 +733,30 @@ static int sign_stub(neverbleed_iobuf_t *buf)
     return 0;
 }
 
+#endif /* !OPENSSL_IS_BORINGSSL */
+
+#if !defined(OPENSSL_IS_BORINGSSL)
+
 /* ======================== OpenSSL 3 Provider ======================== */
 
 #define NEVERBLEED_PARAM_KEY_INDEX "neverbleed-key-index"
 
-static neverbleed_t *nb_provider_global_nb;
+static neverbleed_t *provider_global_nb;
 
-struct nb_provider_ctx {
+struct provider_ctx {
     neverbleed_t *nb;
 };
 
-struct nb_rsa_keydata {
+struct rsa_keydata {
     neverbleed_t *nb;
     size_t key_index;
     BIGNUM *n, *e;
     int has_private;
 };
 
-struct nb_sig_ctx {
-    struct nb_provider_ctx *provctx;
-    struct nb_rsa_keydata *keydata;
+struct sig_ctx {
+    struct provider_ctx *provctx;
+    struct rsa_keydata *keydata;
     unsigned char *tbsdata;
     size_t tbslen, tbscap;
     int md_nid;
@@ -760,9 +764,9 @@ struct nb_sig_ctx {
     int pss_saltlen;
 };
 
-struct nb_asym_cipher_ctx {
-    struct nb_provider_ctx *provctx;
-    struct nb_rsa_keydata *keydata;
+struct asym_cipher_ctx {
+    struct provider_ctx *provctx;
+    struct rsa_keydata *keydata;
     int padding;
     unsigned int tls_client_version;
     unsigned int tls_negotiated_version;
@@ -794,19 +798,19 @@ static inline unsigned int ct_ge_mask(unsigned int a, unsigned int b)
 
 /* --- KEYMGMT --- */
 
-static void *nb_keymgmt_new(void *provctx)
+static void *keymgmt_new(void *provctx)
 {
-    struct nb_rsa_keydata *key = OPENSSL_zalloc(sizeof(*key));
+    struct rsa_keydata *key = OPENSSL_zalloc(sizeof(*key));
     if (key == NULL)
         return NULL;
-    key->nb = ((struct nb_provider_ctx *)provctx)->nb;
+    key->nb = ((struct provider_ctx *)provctx)->nb;
     key->key_index = SIZE_MAX;
     return key;
 }
 
-static void nb_keymgmt_free(void *keydata)
+static void keymgmt_free(void *keydata)
 {
-    struct nb_rsa_keydata *key = keydata;
+    struct rsa_keydata *key = keydata;
     if (key == NULL)
         return;
     if (key->key_index != SIZE_MAX && key->has_private) {
@@ -821,9 +825,9 @@ static void nb_keymgmt_free(void *keydata)
     OPENSSL_free(key);
 }
 
-static int nb_keymgmt_has(const void *keydata, int selection)
+static int keymgmt_has(const void *keydata, int selection)
 {
-    const struct nb_rsa_keydata *key = keydata;
+    const struct rsa_keydata *key = keydata;
     if (key == NULL)
         return 0;
     if ((selection & OSSL_KEYMGMT_SELECT_PUBLIC_KEY) != 0 && (key->n == NULL || key->e == NULL))
@@ -833,9 +837,9 @@ static int nb_keymgmt_has(const void *keydata, int selection)
     return 1;
 }
 
-static int nb_keymgmt_import(void *keydata, int selection, const OSSL_PARAM params[])
+static int keymgmt_import(void *keydata, int selection, const OSSL_PARAM params[])
 {
-    struct nb_rsa_keydata *key = keydata;
+    struct rsa_keydata *key = keydata;
     const OSSL_PARAM *p;
 
     if ((p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_RSA_N)) != NULL) {
@@ -858,7 +862,7 @@ static int nb_keymgmt_import(void *keydata, int selection, const OSSL_PARAM para
     return 1;
 }
 
-static const OSSL_PARAM *nb_keymgmt_import_types(int selection)
+static const OSSL_PARAM *keymgmt_import_types(int selection)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_BN(OSSL_PKEY_PARAM_RSA_N, NULL, 0),
@@ -869,9 +873,9 @@ static const OSSL_PARAM *nb_keymgmt_import_types(int selection)
     return types;
 }
 
-static int nb_keymgmt_get_params(void *keydata, OSSL_PARAM params[])
+static int keymgmt_get_params(void *keydata, OSSL_PARAM params[])
 {
-    struct nb_rsa_keydata *key = keydata;
+    struct rsa_keydata *key = keydata;
     OSSL_PARAM *p;
 
     if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_BITS)) != NULL) {
@@ -903,7 +907,7 @@ static int nb_keymgmt_get_params(void *keydata, OSSL_PARAM params[])
     return 1;
 }
 
-static const OSSL_PARAM *nb_keymgmt_gettable_params(void *provctx)
+static const OSSL_PARAM *keymgmt_gettable_params(void *provctx)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_int(OSSL_PKEY_PARAM_BITS, NULL),
@@ -917,9 +921,9 @@ static const OSSL_PARAM *nb_keymgmt_gettable_params(void *provctx)
     return types;
 }
 
-static int nb_keymgmt_export(void *keydata, int selection, OSSL_CALLBACK *param_cb, void *cbarg)
+static int keymgmt_export(void *keydata, int selection, OSSL_CALLBACK *param_cb, void *cbarg)
 {
-    struct nb_rsa_keydata *key = keydata;
+    struct rsa_keydata *key = keydata;
     OSSL_PARAM_BLD *bld;
     OSSL_PARAM *params;
     int ret;
@@ -940,7 +944,7 @@ static int nb_keymgmt_export(void *keydata, int selection, OSSL_CALLBACK *param_
     return ret;
 }
 
-static const OSSL_PARAM *nb_keymgmt_export_types(int selection)
+static const OSSL_PARAM *keymgmt_export_types(int selection)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_BN(OSSL_PKEY_PARAM_RSA_N, NULL, 0),
@@ -950,24 +954,24 @@ static const OSSL_PARAM *nb_keymgmt_export_types(int selection)
     return types;
 }
 
-static const OSSL_DISPATCH nb_keymgmt_functions[] = {
-    {OSSL_FUNC_KEYMGMT_NEW, (void (*)(void))nb_keymgmt_new},
-    {OSSL_FUNC_KEYMGMT_FREE, (void (*)(void))nb_keymgmt_free},
-    {OSSL_FUNC_KEYMGMT_HAS, (void (*)(void))nb_keymgmt_has},
-    {OSSL_FUNC_KEYMGMT_IMPORT, (void (*)(void))nb_keymgmt_import},
-    {OSSL_FUNC_KEYMGMT_IMPORT_TYPES, (void (*)(void))nb_keymgmt_import_types},
-    {OSSL_FUNC_KEYMGMT_GET_PARAMS, (void (*)(void))nb_keymgmt_get_params},
-    {OSSL_FUNC_KEYMGMT_GETTABLE_PARAMS, (void (*)(void))nb_keymgmt_gettable_params},
-    {OSSL_FUNC_KEYMGMT_EXPORT, (void (*)(void))nb_keymgmt_export},
-    {OSSL_FUNC_KEYMGMT_EXPORT_TYPES, (void (*)(void))nb_keymgmt_export_types},
+static const OSSL_DISPATCH keymgmt_functions[] = {
+    {OSSL_FUNC_KEYMGMT_NEW, (void (*)(void))keymgmt_new},
+    {OSSL_FUNC_KEYMGMT_FREE, (void (*)(void))keymgmt_free},
+    {OSSL_FUNC_KEYMGMT_HAS, (void (*)(void))keymgmt_has},
+    {OSSL_FUNC_KEYMGMT_IMPORT, (void (*)(void))keymgmt_import},
+    {OSSL_FUNC_KEYMGMT_IMPORT_TYPES, (void (*)(void))keymgmt_import_types},
+    {OSSL_FUNC_KEYMGMT_GET_PARAMS, (void (*)(void))keymgmt_get_params},
+    {OSSL_FUNC_KEYMGMT_GETTABLE_PARAMS, (void (*)(void))keymgmt_gettable_params},
+    {OSSL_FUNC_KEYMGMT_EXPORT, (void (*)(void))keymgmt_export},
+    {OSSL_FUNC_KEYMGMT_EXPORT_TYPES, (void (*)(void))keymgmt_export_types},
     {0, NULL},
 };
 
 /* --- SIGNATURE --- */
 
-static void *nb_sig_newctx(void *provctx, const char *propq)
+static void *sig_newctx(void *provctx, const char *propq)
 {
-    struct nb_sig_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
+    struct sig_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
     if (ctx == NULL)
         return NULL;
     ctx->provctx = provctx;
@@ -977,26 +981,26 @@ static void *nb_sig_newctx(void *provctx, const char *propq)
     return ctx;
 }
 
-static void nb_sig_freectx(void *vctx)
+static void sig_freectx(void *vctx)
 {
-    struct nb_sig_ctx *ctx = vctx;
+    struct sig_ctx *ctx = vctx;
     if (ctx == NULL)
         return;
     OPENSSL_free(ctx->tbsdata);
     OPENSSL_free(ctx);
 }
 
-static int nb_sig_sign_init(void *vctx, void *vkey, const OSSL_PARAM params[])
+static int sig_sign_init(void *vctx, void *vkey, const OSSL_PARAM params[])
 {
-    struct nb_sig_ctx *ctx = vctx;
+    struct sig_ctx *ctx = vctx;
     ctx->keydata = vkey;
     return 1;
 }
 
-static int nb_sig_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs, size_t tbslen)
+static int sig_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs, size_t tbslen)
 {
-    struct nb_sig_ctx *ctx = vctx;
-    struct nb_rsa_keydata *key = ctx->keydata;
+    struct sig_ctx *ctx = vctx;
+    struct rsa_keydata *key = ctx->keydata;
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
     neverbleed_iobuf_t buf = {NULL};
     size_t ret;
@@ -1028,9 +1032,9 @@ static int nb_sig_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t si
     return 1;
 }
 
-static int nb_sig_digest_sign_init(void *vctx, const char *mdname, void *vkey, const OSSL_PARAM params[])
+static int sig_digest_sign_init(void *vctx, const char *mdname, void *vkey, const OSSL_PARAM params[])
 {
-    struct nb_sig_ctx *ctx = vctx;
+    struct sig_ctx *ctx = vctx;
     ctx->keydata = vkey;
     if (mdname != NULL) {
         const EVP_MD *md = EVP_get_digestbyname(mdname);
@@ -1040,9 +1044,9 @@ static int nb_sig_digest_sign_init(void *vctx, const char *mdname, void *vkey, c
     return 1;
 }
 
-static int nb_sig_digest_sign_update(void *vctx, const unsigned char *data, size_t datalen)
+static int sig_digest_sign_update(void *vctx, const unsigned char *data, size_t datalen)
 {
-    struct nb_sig_ctx *ctx = vctx;
+    struct sig_ctx *ctx = vctx;
     if (ctx->tbslen + datalen > ctx->tbscap) {
         ctx->tbscap = ctx->tbslen + datalen + 256;
         ctx->tbsdata = OPENSSL_realloc(ctx->tbsdata, ctx->tbscap);
@@ -1054,10 +1058,10 @@ static int nb_sig_digest_sign_update(void *vctx, const unsigned char *data, size
     return 1;
 }
 
-static int nb_sig_digest_sign_final(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize)
+static int sig_digest_sign_final(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize)
 {
-    struct nb_sig_ctx *ctx = vctx;
-    struct nb_rsa_keydata *key = ctx->keydata;
+    struct sig_ctx *ctx = vctx;
+    struct rsa_keydata *key = ctx->keydata;
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
     neverbleed_iobuf_t buf = {NULL};
     size_t retlen;
@@ -1089,28 +1093,28 @@ static int nb_sig_digest_sign_final(void *vctx, unsigned char *sig, size_t *sigl
     return 1;
 }
 
-static int nb_sig_digest_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs,
+static int sig_digest_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs,
                               size_t tbslen)
 {
-    struct nb_sig_ctx *ctx = vctx;
+    struct sig_ctx *ctx = vctx;
 
     /* If called for size query, just return max size */
     if (sig == NULL) {
-        struct nb_rsa_keydata *key = ctx->keydata;
+        struct rsa_keydata *key = ctx->keydata;
         *siglen = key->n ? BN_num_bytes(key->n) : 0;
         return 1;
     }
 
     /* Buffer the data and call final */
     ctx->tbslen = 0;
-    if (!nb_sig_digest_sign_update(vctx, tbs, tbslen))
+    if (!sig_digest_sign_update(vctx, tbs, tbslen))
         return 0;
-    return nb_sig_digest_sign_final(vctx, sig, siglen, sigsize);
+    return sig_digest_sign_final(vctx, sig, siglen, sigsize);
 }
 
-static int nb_sig_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+static int sig_set_ctx_params(void *vctx, const OSSL_PARAM params[])
 {
-    struct nb_sig_ctx *ctx = vctx;
+    struct sig_ctx *ctx = vctx;
     const OSSL_PARAM *p;
 
     if ((p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_PAD_MODE)) != NULL) {
@@ -1137,7 +1141,7 @@ static int nb_sig_set_ctx_params(void *vctx, const OSSL_PARAM params[])
     return 1;
 }
 
-static const OSSL_PARAM *nb_sig_settable_ctx_params(void *vctx, void *provctx)
+static const OSSL_PARAM *sig_settable_ctx_params(void *vctx, void *provctx)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_PAD_MODE, NULL, 0),
@@ -1149,9 +1153,9 @@ static const OSSL_PARAM *nb_sig_settable_ctx_params(void *vctx, void *provctx)
     return types;
 }
 
-static int nb_sig_get_ctx_params(void *vctx, OSSL_PARAM params[])
+static int sig_get_ctx_params(void *vctx, OSSL_PARAM params[])
 {
-    struct nb_sig_ctx *ctx = vctx;
+    struct sig_ctx *ctx = vctx;
     OSSL_PARAM *p;
 
     if ((p = OSSL_PARAM_locate(params, OSSL_SIGNATURE_PARAM_PAD_MODE)) != NULL) {
@@ -1167,7 +1171,7 @@ static int nb_sig_get_ctx_params(void *vctx, OSSL_PARAM params[])
     return 1;
 }
 
-static const OSSL_PARAM *nb_sig_gettable_ctx_params(void *vctx, void *provctx)
+static const OSSL_PARAM *sig_gettable_ctx_params(void *vctx, void *provctx)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_int(OSSL_SIGNATURE_PARAM_PAD_MODE, NULL),
@@ -1177,25 +1181,25 @@ static const OSSL_PARAM *nb_sig_gettable_ctx_params(void *vctx, void *provctx)
     return types;
 }
 
-static const OSSL_DISPATCH nb_sig_functions[] = {
-    {OSSL_FUNC_SIGNATURE_NEWCTX, (void (*)(void))nb_sig_newctx},
-    {OSSL_FUNC_SIGNATURE_FREECTX, (void (*)(void))nb_sig_freectx},
-    {OSSL_FUNC_SIGNATURE_SIGN_INIT, (void (*)(void))nb_sig_sign_init},
-    {OSSL_FUNC_SIGNATURE_SIGN, (void (*)(void))nb_sig_sign},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT, (void (*)(void))nb_sig_digest_sign_init},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE, (void (*)(void))nb_sig_digest_sign_update},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_FINAL, (void (*)(void))nb_sig_digest_sign_final},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN, (void (*)(void))nb_sig_digest_sign},
-    {OSSL_FUNC_SIGNATURE_SET_CTX_PARAMS, (void (*)(void))nb_sig_set_ctx_params},
-    {OSSL_FUNC_SIGNATURE_SETTABLE_CTX_PARAMS, (void (*)(void))nb_sig_settable_ctx_params},
-    {OSSL_FUNC_SIGNATURE_GET_CTX_PARAMS, (void (*)(void))nb_sig_get_ctx_params},
-    {OSSL_FUNC_SIGNATURE_GETTABLE_CTX_PARAMS, (void (*)(void))nb_sig_gettable_ctx_params},
+static const OSSL_DISPATCH sig_functions[] = {
+    {OSSL_FUNC_SIGNATURE_NEWCTX, (void (*)(void))sig_newctx},
+    {OSSL_FUNC_SIGNATURE_FREECTX, (void (*)(void))sig_freectx},
+    {OSSL_FUNC_SIGNATURE_SIGN_INIT, (void (*)(void))sig_sign_init},
+    {OSSL_FUNC_SIGNATURE_SIGN, (void (*)(void))sig_sign},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT, (void (*)(void))sig_digest_sign_init},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE, (void (*)(void))sig_digest_sign_update},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_FINAL, (void (*)(void))sig_digest_sign_final},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN, (void (*)(void))sig_digest_sign},
+    {OSSL_FUNC_SIGNATURE_SET_CTX_PARAMS, (void (*)(void))sig_set_ctx_params},
+    {OSSL_FUNC_SIGNATURE_SETTABLE_CTX_PARAMS, (void (*)(void))sig_settable_ctx_params},
+    {OSSL_FUNC_SIGNATURE_GET_CTX_PARAMS, (void (*)(void))sig_get_ctx_params},
+    {OSSL_FUNC_SIGNATURE_GETTABLE_CTX_PARAMS, (void (*)(void))sig_gettable_ctx_params},
     {0, NULL},
 };
 
 /* --- EC KEYMGMT --- */
 
-struct nb_ec_keydata {
+struct ec_keydata {
     neverbleed_t *nb;
     size_t key_index;
     int curve_nid;
@@ -1204,19 +1208,19 @@ struct nb_ec_keydata {
     int has_private;
 };
 
-static void *nb_ec_keymgmt_new(void *provctx)
+static void *ec_keymgmt_new(void *provctx)
 {
-    struct nb_ec_keydata *key = OPENSSL_zalloc(sizeof(*key));
+    struct ec_keydata *key = OPENSSL_zalloc(sizeof(*key));
     if (key == NULL)
         return NULL;
-    key->nb = ((struct nb_provider_ctx *)provctx)->nb;
+    key->nb = ((struct provider_ctx *)provctx)->nb;
     key->key_index = SIZE_MAX;
     return key;
 }
 
-static void nb_ec_keymgmt_free(void *keydata)
+static void ec_keymgmt_free(void *keydata)
 {
-    struct nb_ec_keydata *key = keydata;
+    struct ec_keydata *key = keydata;
     if (key == NULL)
         return;
     if (key->has_private && key->key_index != SIZE_MAX) {
@@ -1231,9 +1235,9 @@ static void nb_ec_keymgmt_free(void *keydata)
     OPENSSL_free(key);
 }
 
-static int nb_ec_keymgmt_has(const void *keydata, int selection)
+static int ec_keymgmt_has(const void *keydata, int selection)
 {
-    const struct nb_ec_keydata *key = keydata;
+    const struct ec_keydata *key = keydata;
     if (key == NULL)
         return 0;
     if ((selection & OSSL_KEYMGMT_SELECT_PUBLIC_KEY) && key->pub_bytes == NULL)
@@ -1245,9 +1249,9 @@ static int nb_ec_keymgmt_has(const void *keydata, int selection)
     return 1;
 }
 
-static int nb_ec_keymgmt_import(void *keydata, int selection, const OSSL_PARAM params[])
+static int ec_keymgmt_import(void *keydata, int selection, const OSSL_PARAM params[])
 {
-    struct nb_ec_keydata *key = keydata;
+    struct ec_keydata *key = keydata;
     const OSSL_PARAM *p;
 
     if ((p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_GROUP_NAME)) != NULL) {
@@ -1270,7 +1274,7 @@ static int nb_ec_keymgmt_import(void *keydata, int selection, const OSSL_PARAM p
     return 1;
 }
 
-static const OSSL_PARAM *nb_ec_keymgmt_import_types(int selection)
+static const OSSL_PARAM *ec_keymgmt_import_types(int selection)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, NULL, 0),
@@ -1281,9 +1285,9 @@ static const OSSL_PARAM *nb_ec_keymgmt_import_types(int selection)
     return types;
 }
 
-static int nb_ec_keymgmt_get_params(void *keydata, OSSL_PARAM params[])
+static int ec_keymgmt_get_params(void *keydata, OSSL_PARAM params[])
 {
-    struct nb_ec_keydata *key = keydata;
+    struct ec_keydata *key = keydata;
     OSSL_PARAM *p;
     int bits = 0;
 
@@ -1316,7 +1320,7 @@ static int nb_ec_keymgmt_get_params(void *keydata, OSSL_PARAM params[])
     return 1;
 }
 
-static const OSSL_PARAM *nb_ec_keymgmt_gettable_params(void *provctx)
+static const OSSL_PARAM *ec_keymgmt_gettable_params(void *provctx)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_int(OSSL_PKEY_PARAM_BITS, NULL),
@@ -1330,9 +1334,9 @@ static const OSSL_PARAM *nb_ec_keymgmt_gettable_params(void *provctx)
     return types;
 }
 
-static int nb_ec_keymgmt_export(void *keydata, int selection, OSSL_CALLBACK *param_cb, void *cbarg)
+static int ec_keymgmt_export(void *keydata, int selection, OSSL_CALLBACK *param_cb, void *cbarg)
 {
-    struct nb_ec_keydata *key = keydata;
+    struct ec_keydata *key = keydata;
     if (selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY)
         return 0;
     OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
@@ -1351,7 +1355,7 @@ static int nb_ec_keymgmt_export(void *keydata, int selection, OSSL_CALLBACK *par
     return ret;
 }
 
-static const OSSL_PARAM *nb_ec_keymgmt_export_types(int selection)
+static const OSSL_PARAM *ec_keymgmt_export_types(int selection)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, NULL, 0),
@@ -1361,7 +1365,7 @@ static const OSSL_PARAM *nb_ec_keymgmt_export_types(int selection)
     return types;
 }
 
-static const char *nb_ec_keymgmt_query_operation_name(int operation_id)
+static const char *ec_keymgmt_query_operation_name(int operation_id)
 {
     switch (operation_id) {
     case OSSL_OP_SIGNATURE:
@@ -1370,33 +1374,33 @@ static const char *nb_ec_keymgmt_query_operation_name(int operation_id)
     return NULL;
 }
 
-static const OSSL_DISPATCH nb_ec_keymgmt_functions[] = {
-    {OSSL_FUNC_KEYMGMT_NEW, (void (*)(void))nb_ec_keymgmt_new},
-    {OSSL_FUNC_KEYMGMT_FREE, (void (*)(void))nb_ec_keymgmt_free},
-    {OSSL_FUNC_KEYMGMT_HAS, (void (*)(void))nb_ec_keymgmt_has},
-    {OSSL_FUNC_KEYMGMT_IMPORT, (void (*)(void))nb_ec_keymgmt_import},
-    {OSSL_FUNC_KEYMGMT_IMPORT_TYPES, (void (*)(void))nb_ec_keymgmt_import_types},
-    {OSSL_FUNC_KEYMGMT_GET_PARAMS, (void (*)(void))nb_ec_keymgmt_get_params},
-    {OSSL_FUNC_KEYMGMT_GETTABLE_PARAMS, (void (*)(void))nb_ec_keymgmt_gettable_params},
-    {OSSL_FUNC_KEYMGMT_EXPORT, (void (*)(void))nb_ec_keymgmt_export},
-    {OSSL_FUNC_KEYMGMT_EXPORT_TYPES, (void (*)(void))nb_ec_keymgmt_export_types},
-    {OSSL_FUNC_KEYMGMT_QUERY_OPERATION_NAME, (void (*)(void))nb_ec_keymgmt_query_operation_name},
+static const OSSL_DISPATCH ec_keymgmt_functions[] = {
+    {OSSL_FUNC_KEYMGMT_NEW, (void (*)(void))ec_keymgmt_new},
+    {OSSL_FUNC_KEYMGMT_FREE, (void (*)(void))ec_keymgmt_free},
+    {OSSL_FUNC_KEYMGMT_HAS, (void (*)(void))ec_keymgmt_has},
+    {OSSL_FUNC_KEYMGMT_IMPORT, (void (*)(void))ec_keymgmt_import},
+    {OSSL_FUNC_KEYMGMT_IMPORT_TYPES, (void (*)(void))ec_keymgmt_import_types},
+    {OSSL_FUNC_KEYMGMT_GET_PARAMS, (void (*)(void))ec_keymgmt_get_params},
+    {OSSL_FUNC_KEYMGMT_GETTABLE_PARAMS, (void (*)(void))ec_keymgmt_gettable_params},
+    {OSSL_FUNC_KEYMGMT_EXPORT, (void (*)(void))ec_keymgmt_export},
+    {OSSL_FUNC_KEYMGMT_EXPORT_TYPES, (void (*)(void))ec_keymgmt_export_types},
+    {OSSL_FUNC_KEYMGMT_QUERY_OPERATION_NAME, (void (*)(void))ec_keymgmt_query_operation_name},
     {0, NULL},
 };
 
 /* --- EC SIGNATURE --- */
 
-struct nb_ec_sig_ctx {
-    struct nb_provider_ctx *provctx;
-    struct nb_ec_keydata *keydata;
+struct ec_sig_ctx {
+    struct provider_ctx *provctx;
+    struct ec_keydata *keydata;
     unsigned char *tbsdata;
     size_t tbslen, tbscap;
     int md_nid;
 };
 
-static void *nb_ec_sig_newctx(void *provctx, const char *propq)
+static void *ec_sig_newctx(void *provctx, const char *propq)
 {
-    struct nb_ec_sig_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
+    struct ec_sig_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
     if (ctx == NULL)
         return NULL;
     ctx->provctx = provctx;
@@ -1404,25 +1408,25 @@ static void *nb_ec_sig_newctx(void *provctx, const char *propq)
     return ctx;
 }
 
-static void nb_ec_sig_freectx(void *vctx)
+static void ec_sig_freectx(void *vctx)
 {
-    struct nb_ec_sig_ctx *ctx = vctx;
+    struct ec_sig_ctx *ctx = vctx;
     OPENSSL_free(ctx->tbsdata);
     OPENSSL_free(ctx);
 }
 
-static int nb_ec_sig_sign_init(void *vctx, void *vkey, const OSSL_PARAM params[])
+static int ec_sig_sign_init(void *vctx, void *vkey, const OSSL_PARAM params[])
 {
-    struct nb_ec_sig_ctx *ctx = vctx;
+    struct ec_sig_ctx *ctx = vctx;
     ctx->keydata = vkey;
     return 1;
 }
 
-static int nb_ec_sig_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs,
+static int ec_sig_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs,
                           size_t tbslen)
 {
-    struct nb_ec_sig_ctx *ctx = vctx;
-    struct nb_ec_keydata *key = ctx->keydata;
+    struct ec_sig_ctx *ctx = vctx;
+    struct ec_keydata *key = ctx->keydata;
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
 
     /* size query */
@@ -1465,9 +1469,9 @@ static int nb_ec_sig_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t
     return 1;
 }
 
-static int nb_ec_sig_digest_sign_init(void *vctx, const char *mdname, void *vkey, const OSSL_PARAM params[])
+static int ec_sig_digest_sign_init(void *vctx, const char *mdname, void *vkey, const OSSL_PARAM params[])
 {
-    struct nb_ec_sig_ctx *ctx = vctx;
+    struct ec_sig_ctx *ctx = vctx;
     ctx->keydata = vkey;
     if (mdname != NULL) {
         const EVP_MD *md = EVP_get_digestbyname(mdname);
@@ -1477,9 +1481,9 @@ static int nb_ec_sig_digest_sign_init(void *vctx, const char *mdname, void *vkey
     return 1;
 }
 
-static int nb_ec_sig_digest_sign_update(void *vctx, const unsigned char *data, size_t datalen)
+static int ec_sig_digest_sign_update(void *vctx, const unsigned char *data, size_t datalen)
 {
-    struct nb_ec_sig_ctx *ctx = vctx;
+    struct ec_sig_ctx *ctx = vctx;
     if (ctx->tbslen + datalen > ctx->tbscap) {
         size_t newcap = ctx->tbslen + datalen;
         if (newcap < 256)
@@ -1494,10 +1498,10 @@ static int nb_ec_sig_digest_sign_update(void *vctx, const unsigned char *data, s
     return 1;
 }
 
-static int nb_ec_sig_digest_sign_final(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize)
+static int ec_sig_digest_sign_final(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize)
 {
-    struct nb_ec_sig_ctx *ctx = vctx;
-    struct nb_ec_keydata *key = ctx->keydata;
+    struct ec_sig_ctx *ctx = vctx;
+    struct ec_keydata *key = ctx->keydata;
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
 
     if (sig == NULL) {
@@ -1539,12 +1543,12 @@ static int nb_ec_sig_digest_sign_final(void *vctx, unsigned char *sig, size_t *s
     return 1;
 }
 
-static int nb_ec_sig_digest_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs,
+static int ec_sig_digest_sign(void *vctx, unsigned char *sig, size_t *siglen, size_t sigsize, const unsigned char *tbs,
                                  size_t tbslen)
 {
-    struct nb_ec_sig_ctx *ctx = vctx;
+    struct ec_sig_ctx *ctx = vctx;
     if (sig == NULL) {
-        struct nb_ec_keydata *key = ctx->keydata;
+        struct ec_keydata *key = ctx->keydata;
         int bits = 0;
         if (key->curve_nid != 0) {
             EC_GROUP *group = EC_GROUP_new_by_curve_name(key->curve_nid);
@@ -1557,14 +1561,14 @@ static int nb_ec_sig_digest_sign(void *vctx, unsigned char *sig, size_t *siglen,
         *siglen = 2 * (order_bytes + 1) + 6;
         return 1;
     }
-    if (!nb_ec_sig_digest_sign_update(vctx, tbs, tbslen))
+    if (!ec_sig_digest_sign_update(vctx, tbs, tbslen))
         return 0;
-    return nb_ec_sig_digest_sign_final(vctx, sig, siglen, sigsize);
+    return ec_sig_digest_sign_final(vctx, sig, siglen, sigsize);
 }
 
-static int nb_ec_sig_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+static int ec_sig_set_ctx_params(void *vctx, const OSSL_PARAM params[])
 {
-    struct nb_ec_sig_ctx *ctx = vctx;
+    struct ec_sig_ctx *ctx = vctx;
     const OSSL_PARAM *p;
 
     if ((p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_DIGEST)) != NULL) {
@@ -1577,7 +1581,7 @@ static int nb_ec_sig_set_ctx_params(void *vctx, const OSSL_PARAM params[])
     return 1;
 }
 
-static const OSSL_PARAM *nb_ec_sig_settable_ctx_params(void *vctx, void *provctx)
+static const OSSL_PARAM *ec_sig_settable_ctx_params(void *vctx, void *provctx)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_DIGEST, NULL, 0),
@@ -1586,9 +1590,9 @@ static const OSSL_PARAM *nb_ec_sig_settable_ctx_params(void *vctx, void *provctx
     return types;
 }
 
-static int nb_ec_sig_get_ctx_params(void *vctx, OSSL_PARAM params[])
+static int ec_sig_get_ctx_params(void *vctx, OSSL_PARAM params[])
 {
-    struct nb_ec_sig_ctx *ctx = vctx;
+    struct ec_sig_ctx *ctx = vctx;
     OSSL_PARAM *p;
 
     if ((p = OSSL_PARAM_locate(params, OSSL_SIGNATURE_PARAM_DIGEST)) != NULL) {
@@ -1599,7 +1603,7 @@ static int nb_ec_sig_get_ctx_params(void *vctx, OSSL_PARAM params[])
     return 1;
 }
 
-static const OSSL_PARAM *nb_ec_sig_gettable_ctx_params(void *vctx, void *provctx)
+static const OSSL_PARAM *ec_sig_gettable_ctx_params(void *vctx, void *provctx)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_utf8_string(OSSL_SIGNATURE_PARAM_DIGEST, NULL, 0),
@@ -1608,27 +1612,27 @@ static const OSSL_PARAM *nb_ec_sig_gettable_ctx_params(void *vctx, void *provctx
     return types;
 }
 
-static const OSSL_DISPATCH nb_ec_sig_functions[] = {
-    {OSSL_FUNC_SIGNATURE_NEWCTX, (void (*)(void))nb_ec_sig_newctx},
-    {OSSL_FUNC_SIGNATURE_FREECTX, (void (*)(void))nb_ec_sig_freectx},
-    {OSSL_FUNC_SIGNATURE_SIGN_INIT, (void (*)(void))nb_ec_sig_sign_init},
-    {OSSL_FUNC_SIGNATURE_SIGN, (void (*)(void))nb_ec_sig_sign},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT, (void (*)(void))nb_ec_sig_digest_sign_init},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE, (void (*)(void))nb_ec_sig_digest_sign_update},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_FINAL, (void (*)(void))nb_ec_sig_digest_sign_final},
-    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN, (void (*)(void))nb_ec_sig_digest_sign},
-    {OSSL_FUNC_SIGNATURE_SET_CTX_PARAMS, (void (*)(void))nb_ec_sig_set_ctx_params},
-    {OSSL_FUNC_SIGNATURE_SETTABLE_CTX_PARAMS, (void (*)(void))nb_ec_sig_settable_ctx_params},
-    {OSSL_FUNC_SIGNATURE_GET_CTX_PARAMS, (void (*)(void))nb_ec_sig_get_ctx_params},
-    {OSSL_FUNC_SIGNATURE_GETTABLE_CTX_PARAMS, (void (*)(void))nb_ec_sig_gettable_ctx_params},
+static const OSSL_DISPATCH ec_sig_functions[] = {
+    {OSSL_FUNC_SIGNATURE_NEWCTX, (void (*)(void))ec_sig_newctx},
+    {OSSL_FUNC_SIGNATURE_FREECTX, (void (*)(void))ec_sig_freectx},
+    {OSSL_FUNC_SIGNATURE_SIGN_INIT, (void (*)(void))ec_sig_sign_init},
+    {OSSL_FUNC_SIGNATURE_SIGN, (void (*)(void))ec_sig_sign},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_INIT, (void (*)(void))ec_sig_digest_sign_init},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_UPDATE, (void (*)(void))ec_sig_digest_sign_update},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN_FINAL, (void (*)(void))ec_sig_digest_sign_final},
+    {OSSL_FUNC_SIGNATURE_DIGEST_SIGN, (void (*)(void))ec_sig_digest_sign},
+    {OSSL_FUNC_SIGNATURE_SET_CTX_PARAMS, (void (*)(void))ec_sig_set_ctx_params},
+    {OSSL_FUNC_SIGNATURE_SETTABLE_CTX_PARAMS, (void (*)(void))ec_sig_settable_ctx_params},
+    {OSSL_FUNC_SIGNATURE_GET_CTX_PARAMS, (void (*)(void))ec_sig_get_ctx_params},
+    {OSSL_FUNC_SIGNATURE_GETTABLE_CTX_PARAMS, (void (*)(void))ec_sig_gettable_ctx_params},
     {0, NULL},
 };
 
 /* --- ASYM_CIPHER --- */
 
-static void *nb_asym_cipher_newctx(void *provctx)
+static void *asym_cipher_newctx(void *provctx)
 {
-    struct nb_asym_cipher_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
+    struct asym_cipher_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
     if (ctx == NULL)
         return NULL;
     ctx->provctx = provctx;
@@ -1636,23 +1640,23 @@ static void *nb_asym_cipher_newctx(void *provctx)
     return ctx;
 }
 
-static void nb_asym_cipher_freectx(void *vctx)
+static void asym_cipher_freectx(void *vctx)
 {
     OPENSSL_free(vctx);
 }
 
-static int nb_asym_cipher_decrypt_init(void *vctx, void *vkey, const OSSL_PARAM params[])
+static int asym_cipher_decrypt_init(void *vctx, void *vkey, const OSSL_PARAM params[])
 {
-    struct nb_asym_cipher_ctx *ctx = vctx;
+    struct asym_cipher_ctx *ctx = vctx;
     ctx->keydata = vkey;
     return 1;
 }
 
-static int nb_asym_cipher_decrypt(void *vctx, unsigned char *out, size_t *outlen, size_t outsize, const unsigned char *in,
+static int asym_cipher_decrypt(void *vctx, unsigned char *out, size_t *outlen, size_t outsize, const unsigned char *in,
                                   size_t inlen)
 {
-    struct nb_asym_cipher_ctx *ctx = vctx;
-    struct nb_rsa_keydata *key = ctx->keydata;
+    struct asym_cipher_ctx *ctx = vctx;
+    struct rsa_keydata *key = ctx->keydata;
     struct st_neverbleed_thread_data_t *thdata = get_thread_data(key->nb);
     int rsa_size = key->n ? BN_num_bytes(key->n) : 0;
 
@@ -1792,9 +1796,9 @@ static int nb_asym_cipher_decrypt(void *vctx, unsigned char *out, size_t *outlen
     return 0;
 }
 
-static int nb_asym_cipher_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+static int asym_cipher_set_ctx_params(void *vctx, const OSSL_PARAM params[])
 {
-    struct nb_asym_cipher_ctx *ctx = vctx;
+    struct asym_cipher_ctx *ctx = vctx;
     const OSSL_PARAM *p;
 
     if ((p = OSSL_PARAM_locate_const(params, OSSL_ASYM_CIPHER_PARAM_PAD_MODE)) != NULL) {
@@ -1816,7 +1820,7 @@ static int nb_asym_cipher_set_ctx_params(void *vctx, const OSSL_PARAM params[])
     return 1;
 }
 
-static const OSSL_PARAM *nb_asym_cipher_settable_ctx_params(void *vctx, void *provctx)
+static const OSSL_PARAM *asym_cipher_settable_ctx_params(void *vctx, void *provctx)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_utf8_string(OSSL_ASYM_CIPHER_PARAM_PAD_MODE, NULL, 0),
@@ -1827,9 +1831,9 @@ static const OSSL_PARAM *nb_asym_cipher_settable_ctx_params(void *vctx, void *pr
     return types;
 }
 
-static int nb_asym_cipher_get_ctx_params(void *vctx, OSSL_PARAM params[])
+static int asym_cipher_get_ctx_params(void *vctx, OSSL_PARAM params[])
 {
-    struct nb_asym_cipher_ctx *ctx = vctx;
+    struct asym_cipher_ctx *ctx = vctx;
     OSSL_PARAM *p;
 
     if ((p = OSSL_PARAM_locate(params, OSSL_ASYM_CIPHER_PARAM_PAD_MODE)) != NULL) {
@@ -1839,7 +1843,7 @@ static int nb_asym_cipher_get_ctx_params(void *vctx, OSSL_PARAM params[])
     return 1;
 }
 
-static const OSSL_PARAM *nb_asym_cipher_gettable_ctx_params(void *vctx, void *provctx)
+static const OSSL_PARAM *asym_cipher_gettable_ctx_params(void *vctx, void *provctx)
 {
     static const OSSL_PARAM types[] = {
         OSSL_PARAM_int(OSSL_ASYM_CIPHER_PARAM_PAD_MODE, NULL),
@@ -1848,70 +1852,70 @@ static const OSSL_PARAM *nb_asym_cipher_gettable_ctx_params(void *vctx, void *pr
     return types;
 }
 
-static const OSSL_DISPATCH nb_asym_cipher_functions[] = {
-    {OSSL_FUNC_ASYM_CIPHER_NEWCTX, (void (*)(void))nb_asym_cipher_newctx},
-    {OSSL_FUNC_ASYM_CIPHER_FREECTX, (void (*)(void))nb_asym_cipher_freectx},
-    {OSSL_FUNC_ASYM_CIPHER_DECRYPT_INIT, (void (*)(void))nb_asym_cipher_decrypt_init},
-    {OSSL_FUNC_ASYM_CIPHER_DECRYPT, (void (*)(void))nb_asym_cipher_decrypt},
-    {OSSL_FUNC_ASYM_CIPHER_SET_CTX_PARAMS, (void (*)(void))nb_asym_cipher_set_ctx_params},
-    {OSSL_FUNC_ASYM_CIPHER_SETTABLE_CTX_PARAMS, (void (*)(void))nb_asym_cipher_settable_ctx_params},
-    {OSSL_FUNC_ASYM_CIPHER_GET_CTX_PARAMS, (void (*)(void))nb_asym_cipher_get_ctx_params},
-    {OSSL_FUNC_ASYM_CIPHER_GETTABLE_CTX_PARAMS, (void (*)(void))nb_asym_cipher_gettable_ctx_params},
+static const OSSL_DISPATCH asym_cipher_functions[] = {
+    {OSSL_FUNC_ASYM_CIPHER_NEWCTX, (void (*)(void))asym_cipher_newctx},
+    {OSSL_FUNC_ASYM_CIPHER_FREECTX, (void (*)(void))asym_cipher_freectx},
+    {OSSL_FUNC_ASYM_CIPHER_DECRYPT_INIT, (void (*)(void))asym_cipher_decrypt_init},
+    {OSSL_FUNC_ASYM_CIPHER_DECRYPT, (void (*)(void))asym_cipher_decrypt},
+    {OSSL_FUNC_ASYM_CIPHER_SET_CTX_PARAMS, (void (*)(void))asym_cipher_set_ctx_params},
+    {OSSL_FUNC_ASYM_CIPHER_SETTABLE_CTX_PARAMS, (void (*)(void))asym_cipher_settable_ctx_params},
+    {OSSL_FUNC_ASYM_CIPHER_GET_CTX_PARAMS, (void (*)(void))asym_cipher_get_ctx_params},
+    {OSSL_FUNC_ASYM_CIPHER_GETTABLE_CTX_PARAMS, (void (*)(void))asym_cipher_gettable_ctx_params},
     {0, NULL},
 };
 
 /* --- Provider entry point --- */
 
-static const OSSL_ALGORITHM nb_keymgmts[] = {
-    {"RSA", "provider=neverbleed", nb_keymgmt_functions, "Neverbleed RSA KEYMGMT"},
-    {"EC", "provider=neverbleed", nb_ec_keymgmt_functions, "Neverbleed EC KEYMGMT"},
+static const OSSL_ALGORITHM keymgmts[] = {
+    {"RSA", "provider=neverbleed", keymgmt_functions, "Neverbleed RSA KEYMGMT"},
+    {"EC", "provider=neverbleed", ec_keymgmt_functions, "Neverbleed EC KEYMGMT"},
     {NULL, NULL, NULL, NULL},
 };
 
-static const OSSL_ALGORITHM nb_signatures[] = {
-    {"RSA", "provider=neverbleed", nb_sig_functions, "Neverbleed RSA Signature"},
-    {"ECDSA", "provider=neverbleed", nb_ec_sig_functions, "Neverbleed ECDSA Signature"},
+static const OSSL_ALGORITHM signatures[] = {
+    {"RSA", "provider=neverbleed", sig_functions, "Neverbleed RSA Signature"},
+    {"ECDSA", "provider=neverbleed", ec_sig_functions, "Neverbleed ECDSA Signature"},
     {NULL, NULL, NULL, NULL},
 };
 
-static const OSSL_ALGORITHM nb_asym_ciphers[] = {
-    {"RSA", "provider=neverbleed", nb_asym_cipher_functions, "Neverbleed RSA Asymmetric Cipher"},
+static const OSSL_ALGORITHM asym_ciphers[] = {
+    {"RSA", "provider=neverbleed", asym_cipher_functions, "Neverbleed RSA Asymmetric Cipher"},
     {NULL, NULL, NULL, NULL},
 };
 
-static const OSSL_ALGORITHM *nb_provider_query_operation(void *provctx, int operation_id, int *no_cache)
+static const OSSL_ALGORITHM *provider_query_operation(void *provctx, int operation_id, int *no_cache)
 {
     *no_cache = 0;
     switch (operation_id) {
     case OSSL_OP_KEYMGMT:
-        return nb_keymgmts;
+        return keymgmts;
     case OSSL_OP_SIGNATURE:
-        return nb_signatures;
+        return signatures;
     case OSSL_OP_ASYM_CIPHER:
-        return nb_asym_ciphers;
+        return asym_ciphers;
     }
     return NULL;
 }
 
-static void nb_provider_teardown(void *provctx)
+static void provider_teardown(void *provctx)
 {
     OPENSSL_free(provctx);
 }
 
-static const OSSL_DISPATCH nb_provider_dispatch[] = {
-    {OSSL_FUNC_PROVIDER_TEARDOWN, (void (*)(void))nb_provider_teardown},
-    {OSSL_FUNC_PROVIDER_QUERY_OPERATION, (void (*)(void))nb_provider_query_operation},
+static const OSSL_DISPATCH provider_dispatch[] = {
+    {OSSL_FUNC_PROVIDER_TEARDOWN, (void (*)(void))provider_teardown},
+    {OSSL_FUNC_PROVIDER_QUERY_OPERATION, (void (*)(void))provider_query_operation},
     {0, NULL},
 };
 
-static int nb_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in, const OSSL_DISPATCH **out, void **provctx)
+static int provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in, const OSSL_DISPATCH **out, void **provctx)
 {
-    struct nb_provider_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
+    struct provider_ctx *ctx = OPENSSL_zalloc(sizeof(*ctx));
     if (ctx == NULL)
         return 0;
-    ctx->nb = nb_provider_global_nb;
+    ctx->nb = provider_global_nb;
     *provctx = ctx;
-    *out = nb_provider_dispatch;
+    *out = provider_dispatch;
     return 1;
 }
 
@@ -2248,7 +2252,7 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const 
         OSSL_PARAM get_params[] = {OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, &key_index), OSSL_PARAM_END};
         if (!EVP_PKEY_get_params(pkey, get_params))
             dief("failed to get key_index from provider key");
-        nb_ref = nb_provider_global_nb;
+        nb_ref = provider_global_nb;
         cmd = "digestsign-rsa";
     } break;
 #ifdef NEVERBLEED_ECDSA
@@ -2256,7 +2260,7 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const 
         OSSL_PARAM get_params[] = {OSSL_PARAM_size_t(NEVERBLEED_PARAM_KEY_INDEX, &key_index), OSSL_PARAM_END};
         if (!EVP_PKEY_get_params(pkey, get_params))
             dief("failed to get key_index from provider key");
-        nb_ref = nb_provider_global_nb;
+        nb_ref = provider_global_nb;
     } break;
 #endif
     default:
@@ -3144,8 +3148,8 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     /* no engine/provider for BoringSSL */
 #else
     { /* setup provider for RSA and ECDSA */
-        nb_provider_global_nb = nb;
-        if (!OSSL_PROVIDER_add_builtin(NULL, "neverbleed", nb_provider_init)) {
+        provider_global_nb = nb;
+        if (!OSSL_PROVIDER_add_builtin(NULL, "neverbleed", provider_init)) {
             snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "OSSL_PROVIDER_add_builtin failed");
             goto Fail;
         }
