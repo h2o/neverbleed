@@ -77,6 +77,10 @@
 #include <openssl/provider.h>
 #endif
 
+#ifndef NEVERBLEED_MAX_RSA_BYTES
+#define NEVERBLEED_MAX_RSA_BYTES 4096
+#endif
+
 #ifdef __linux
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL && !defined(OPENSSL_IS_BORINGSSL)
 #define USE_OFFLOAD 1
@@ -531,10 +535,10 @@ struct engine_request {
 #ifdef OPENSSL_IS_BORINGSSL
     struct {
         RSA *rsa;
-        uint8_t output[512];
+        uint8_t output[NEVERBLEED_MAX_RSA_BYTES];
         union {
             struct {
-                uint8_t padded[512];
+                uint8_t padded[NEVERBLEED_MAX_RSA_BYTES];
             } digestsign;
         };
     } data;
@@ -722,7 +726,11 @@ static int priv_dec_stub(neverbleed_iobuf_t *buf)
         warnf("%s: invalid key index:%zu", __FUNCTION__, key_index);
         return -1;
     }
-    unsigned char to[4096];
+    if (RSA_size(rsa) > NEVERBLEED_MAX_RSA_BYTES) {
+        errno = 0;
+        dief("%s: RSA key too large (%d bytes)", __FUNCTION__, RSA_size(rsa));
+    }
+    unsigned char to[NEVERBLEED_MAX_RSA_BYTES];
     int ret = RSA_private_decrypt((int)flen, from, to, rsa, (int)padding);
     iobuf_dispose(buf);
     RSA_free(rsa);
@@ -733,7 +741,7 @@ static int priv_dec_stub(neverbleed_iobuf_t *buf)
 
 static int sign_stub(neverbleed_iobuf_t *buf)
 {
-    unsigned char *m, sigret[4096];
+    unsigned char *m, sigret[NEVERBLEED_MAX_RSA_BYTES];
     size_t type, m_len, key_index;
     RSA *rsa;
     unsigned siglen = 0;
@@ -748,6 +756,10 @@ static int sign_stub(neverbleed_iobuf_t *buf)
         errno = 0;
         warnf("%s: invalid key index:%zu", __FUNCTION__, key_index);
         return -1;
+    }
+    if (RSA_size(rsa) > NEVERBLEED_MAX_RSA_BYTES) {
+        errno = 0;
+        dief("%s: RSA key too large (%d bytes)", __FUNCTION__, RSA_size(rsa));
     }
     ret = RSA_sign((int)type, m, (unsigned)m_len, sigret, &siglen, rsa);
     iobuf_dispose(buf);
@@ -1917,7 +1929,6 @@ static int ecdsa_sign_stub(neverbleed_iobuf_t *buf)
         warnf("%s: invalid key index:%zu", __FUNCTION__, key_index);
         return -1;
     }
-
     ret = ECDSA_sign((int)type, m, (unsigned)m_len, sigret, &siglen, ec_key);
     iobuf_dispose(buf);
 
@@ -1992,8 +2003,10 @@ static struct engine_request *bssl_offload_create_request(neverbleed_iobuf_t *bu
 
     if (req->async_ctx == NULL)
         dief("failed to initialize async job\n");
-    if (RSA_size(req->data.rsa) > sizeof(req->data.output))
-        dief("RSA key too large\n");
+    if (RSA_size(req->data.rsa) > NEVERBLEED_MAX_RSA_BYTES) {
+        errno = 0;
+        dief("%s: RSA key too large (%d bytes)", __FUNCTION__, RSA_size(req->data.rsa));
+    }
 
     return req;
 }
@@ -2223,7 +2236,7 @@ static int decrypt_stub(neverbleed_iobuf_t *buf)
     void *src;
     EVP_PKEY *pkey;
     RSA *rsa;
-    uint8_t decryptbuf[1024];
+    uint8_t decryptbuf[NEVERBLEED_MAX_RSA_BYTES];
     int decryptlen;
 
     /* parse input */
@@ -2240,7 +2253,10 @@ static int decrypt_stub(neverbleed_iobuf_t *buf)
 
     rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
     assert(rsa != NULL);
-    assert(sizeof(decryptbuf) >= RSA_size(rsa));
+    if (RSA_size(rsa) > NEVERBLEED_MAX_RSA_BYTES) {
+        errno = 0;
+        dief("%s: RSA key too large (%d bytes)", __FUNCTION__, RSA_size(rsa));
+    }
 
 #if USE_OFFLOAD && defined(OPENSSL_IS_BORINGSSL)
     if (use_offload) {
@@ -2392,6 +2408,13 @@ static int load_key_stub(neverbleed_iobuf_t *buf)
         const BIGNUM *e, *n;
 
         rsa = EVP_PKEY_get1_RSA(pkey);
+        /* Reject large key sizes */
+        if (RSA_size(rsa) > NEVERBLEED_MAX_RSA_BYTES) {
+            snprintf(errbuf, sizeof(errbuf),
+                "RSA key too large (%d bytes); neverbleed maximum is %d bytes (%d bits)",
+                RSA_size(rsa), NEVERBLEED_MAX_RSA_BYTES, NEVERBLEED_MAX_RSA_BYTES * 8);
+            goto Respond;
+        }
         type = NEVERBLEED_TYPE_RSA;
         RSA_get0_key(rsa, &n, &e, NULL);
         estr = BN_bn2hex(e);
