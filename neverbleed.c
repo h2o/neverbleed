@@ -2278,6 +2278,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
     pthread_key_create(&nb->thread_key, dispose_thread_data);
 
     free(tempdir);
+    tempdir = NULL;
     return 0;
 Fail:
     if (pipe_fds[0] != -1)
