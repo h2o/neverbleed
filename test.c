@@ -208,7 +208,7 @@ int main(int argc, char **argv)
     SSL_load_error_strings();
     SSL_library_init();
     OpenSSL_add_all_algorithms();
-    if (neverbleed_init(&nb, errbuf) != 0) {
+    if (neverbleed_init(&nb, 3, 5, errbuf) != 0) {
         fprintf(stderr, "openssl_privsep_init: %s\n", errbuf);
         return 111;
     }
