@@ -1730,7 +1730,7 @@ Respond:
 
 __attribute__((noreturn)) static void *daemon_close_notify_thread(void *_close_notify_fd)
 {
-    int close_notify_fd = (int)((char *)_close_notify_fd - (char *)NULL);
+    int close_notify_fd = (int)(intptr_t)_close_notify_fd;
     char b;
     ssize_t r;
 
@@ -1926,7 +1926,7 @@ static int wait_for_data(int cleanup)
 
 static void *daemon_conn_thread(void *_sock_fd)
 {
-    conn_ctx.sockfd = (int)((char *)_sock_fd - (char *)NULL);
+    conn_ctx.sockfd = (int)(intptr_t)_sock_fd;
     conn_ctx.responses.next = &conn_ctx.responses.first;
     neverbleed_iobuf_t *buf = NULL;
 
@@ -2115,13 +2115,13 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
         break;
     }
 
-    if (pthread_create(&tid, &thattr, daemon_close_notify_thread, (char *)NULL + close_notify_fd) != 0)
+    if (pthread_create(&tid, &thattr, daemon_close_notify_thread, (char *)(intptr_t)close_notify_fd) != 0)
         dief("pthread_create failed");
 
     while (1) {
         while ((sock_fd = accept(listen_fd, NULL, NULL)) == -1)
             ;
-        if (pthread_create(&tid, &thattr, daemon_conn_thread, (char *)NULL + sock_fd) != 0)
+        if (pthread_create(&tid, &thattr, daemon_conn_thread, (char *)(intptr_t)sock_fd) != 0)
             dief("pthread_create failed");
     }
 }
