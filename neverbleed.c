@@ -255,8 +255,9 @@ static int read_nbytes(int fd, void *p, size_t sz)
  */
 static void iobuf_dispose(neverbleed_iobuf_t *buf)
 {
-    if (buf->capacity != 0)
-        OPENSSL_cleanse(buf->buf, buf->capacity);
+    /* nothing is ever written past `end` */
+    if (buf->buf != NULL)
+        OPENSSL_cleanse(buf->buf, buf->end - buf->buf);
     free(buf->buf);
     buf->buf = NULL;
     buf->start = NULL;
