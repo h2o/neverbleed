@@ -255,8 +255,9 @@ static int read_nbytes(int fd, void *p, size_t sz)
  */
 static void iobuf_dispose(neverbleed_iobuf_t *buf)
 {
-    if (buf->capacity != 0)
-        OPENSSL_cleanse(buf->buf, buf->capacity);
+    /* nothing is ever written past `end` */
+    if (buf->buf != NULL)
+        OPENSSL_cleanse(buf->buf, buf->end - buf->buf);
     free(buf->buf);
     buf->buf = NULL;
     buf->start = NULL;
@@ -583,7 +584,8 @@ static void get_privsep_data(const RSA *rsa, struct st_neverbleed_rsa_exdata_t *
         errno = 0;
         dief("invalid internal ref");
     }
-    *thdata = get_thread_data((*exdata)->nb);
+    if (thdata != NULL)
+        *thdata = get_thread_data((*exdata)->nb);
 }
 
 static struct {
@@ -1005,7 +1007,8 @@ static void ecdsa_get_privsep_data(const EC_KEY *ec_key, struct st_neverbleed_rs
         errno = 0;
         dief("invalid internal ref");
     }
-    *thdata = get_thread_data((*exdata)->nb);
+    if (thdata != NULL)
+        *thdata = get_thread_data((*exdata)->nb);
 }
 
 static int ecdsa_sign_proxy(int type, const unsigned char *m, int m_len, unsigned char *_sigret, unsigned int *_siglen,
@@ -1297,20 +1300,19 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const 
                                  int rsa_pss)
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
     const char *cmd = "digestsign";
 
     /* obtain reference */
     switch (EVP_PKEY_base_id(pkey)) {
     case EVP_PKEY_RSA: {
         RSA *rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
-        get_privsep_data(rsa, &exdata, &thdata);
+        get_privsep_data(rsa, &exdata, NULL);
         RSA_free(rsa);
         cmd = "digestsign-rsa";
     } break;
 #ifdef NEVERBLEED_ECDSA
     case EVP_PKEY_EC:
-        ecdsa_get_privsep_data(EVP_PKEY_get0_EC_KEY(pkey), &exdata, &thdata);
+        ecdsa_get_privsep_data(EVP_PKEY_get0_EC_KEY(pkey), &exdata, NULL);
         break;
 #endif
     default:
@@ -1400,12 +1402,11 @@ Softfail:
 void neverbleed_start_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const void *input, size_t len)
 {
     struct st_neverbleed_rsa_exdata_t *exdata;
-    struct st_neverbleed_thread_data_t *thdata;
 
     {
         RSA *rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
         assert(rsa != NULL);
-        get_privsep_data(rsa, &exdata, &thdata);
+        get_privsep_data(rsa, &exdata, NULL);
         RSA_free(rsa);
     }
 
